@@ -162,7 +162,7 @@ class MainWindow(QMainWindow):
 
         self.spin_min_area = QSpinBox()
         self.spin_min_area.setRange(10, 10000)
-        self.spin_min_area.setValue(50)
+        self.spin_min_area.setValue(100)
         param_form.addRow("최소 면적 (px):", self.spin_min_area)
 
         self.spin_max_area = QSpinBox()
@@ -170,6 +170,16 @@ class MainWindow(QMainWindow):
         self.spin_max_area.setValue(0)
         self.spin_max_area.setSpecialValueText("제한 없음")
         param_form.addRow("최대 면적 (px):", self.spin_max_area)
+
+        self.spin_circularity = QDoubleSpinBox()
+        self.spin_circularity.setRange(0.1, 1.0)
+        self.spin_circularity.setValue(0.5)
+        self.spin_circularity.setSingleStep(0.05)
+        param_form.addRow("원형도 필터:", self.spin_circularity)
+
+        self.chk_watershed = QCheckBox("겹침 분리 (Watershed)")
+        self.chk_watershed.setChecked(True)
+        param_form.addRow(self.chk_watershed)
 
         param_group.setLayout(param_form)
         right_layout.addWidget(param_group)
@@ -266,6 +276,8 @@ class MainWindow(QMainWindow):
             self.original_image,
             min_area_px=self.spin_min_area.value(),
             max_area_px=max_area,
+            circularity_thresh=self.spin_circularity.value(),
+            use_watershed=self.chk_watershed.isChecked(),
         )
 
         self._draw_results()
