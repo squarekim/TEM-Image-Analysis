@@ -84,13 +84,15 @@ class ParticleAnalyzer:
         self.nm_per_px = nm_per_px
 
     def analyze(self, image, min_area_px=100, max_area_px=None,
-                circularity_thresh=0.5, use_watershed=True):
+                circularity_thresh=0.5, use_watershed=True, hollow=False):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
         cutoff = self._find_scalebar_top(gray)
         analysis_region = gray[:cutoff, :]
 
         binary = self._preprocess(analysis_region)
+        if hollow:
+            binary = self._enhance_hollow(binary, analysis_region)
         binary = self._remove_edge_objects(binary)
 
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -138,6 +140,31 @@ class ParticleAnalyzer:
             if dark_ratio > 0.5:
                 return row
         return int(h * 0.9)
+
+    @staticmethod
+    def _enhance_hollow(binary, gray):
+        denoised = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(denoised, 50, 150)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        edges = cv2.dilate(edges, kernel, iterations=1)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        combined = cv2.bitwise_or(binary, edges)
+
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel_open, iterations=2)
+
+        filled = ParticleAnalyzer._fill_holes(combined)
+        filled = cv2.morphologyEx(filled, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        return filled
+
+    @staticmethod
+    def _fill_holes(binary):
+        h, w = binary.shape
+        flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+        inv = cv2.bitwise_not(binary)
+        cv2.floodFill(inv, flood_mask, (0, 0), 0)
+        return cv2.bitwise_or(binary, inv)
 
     def _preprocess(self, gray):
         denoised = cv2.bilateralFilter(gray, 9, 75, 75)
@@ -207,6 +234,8 @@ class ParticleAnalyzer:
         color = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR) if len(gray.shape) == 2 else gray.copy()
         cv2.watershed(color, markers)
 
+        expected_particle_area = np.pi * (max_val * 0.8) ** 2
+
         results = []
         for label_id in range(2, num_labels + 1):
             seg_mask = np.uint8(markers == label_id) * 255
@@ -216,6 +245,8 @@ class ParticleAnalyzer:
             seg_cnt = max(seg_contours, key=cv2.contourArea)
             seg_area = cv2.contourArea(seg_cnt)
             if seg_area < min_area_px:
+                continue
+            if seg_area < expected_particle_area * 0.15:
                 continue
             seg_perim = cv2.arcLength(seg_cnt, True)
             if seg_perim == 0:

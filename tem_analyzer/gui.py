@@ -181,6 +181,11 @@ class MainWindow(QMainWindow):
         self.chk_watershed.setChecked(True)
         param_form.addRow(self.chk_watershed)
 
+        self.chk_hollow = QCheckBox("Hollow 입자 모드")
+        self.chk_hollow.setChecked(False)
+        self.chk_hollow.setToolTip("속이 빈 입자 (실리카 등)의 링 형태를 채워서 검출")
+        param_form.addRow(self.chk_hollow)
+
         param_group.setLayout(param_form)
         right_layout.addWidget(param_group)
 
@@ -278,6 +283,7 @@ class MainWindow(QMainWindow):
             max_area_px=max_area,
             circularity_thresh=self.spin_circularity.value(),
             use_watershed=self.chk_watershed.isChecked(),
+            hollow=self.chk_hollow.isChecked(),
         )
 
         self._draw_results()
