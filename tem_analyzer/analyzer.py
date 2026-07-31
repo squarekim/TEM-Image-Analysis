@@ -87,7 +87,8 @@ class ParticleAnalyzer:
                 circularity_thresh=0.5, use_watershed=True):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
-        analysis_region = gray[:int(h * 0.85), :]
+        cutoff = self._find_scalebar_top(gray)
+        analysis_region = gray[:cutoff, :]
 
         binary = self._preprocess(analysis_region)
         binary = self._remove_edge_objects(binary)
@@ -128,13 +129,30 @@ class ParticleAnalyzer:
         fill_ratio = area / circle_area if circle_area > 0 else 0
         return fill_ratio > 0.75
 
+    @staticmethod
+    def _find_scalebar_top(gray):
+        h, w = gray.shape
+        for row in range(h - 1, int(h * 0.7), -1):
+            line = gray[row, :]
+            dark_ratio = np.sum(line < 30) / w
+            if dark_ratio > 0.5:
+                return row
+        return int(h * 0.9)
+
     def _preprocess(self, gray):
         denoised = cv2.bilateralFilter(gray, 9, 75, 75)
 
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(denoised)
 
-        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        adaptive = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 31, 5
+        )
+
+        binary = cv2.bitwise_or(otsu, adaptive)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
