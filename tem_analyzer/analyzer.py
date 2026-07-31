@@ -1,7 +1,12 @@
 import cv2
 import numpy as np
-import pytesseract
 import re
+
+try:
+    import pytesseract
+    HAS_TESSERACT = True
+except ImportError:
+    HAS_TESSERACT = False
 
 
 class ScaleBarDetector:
@@ -23,6 +28,8 @@ class ScaleBarDetector:
         return nm_per_px, f"{scale_value} {unit}"
 
     def _extract_scale_text(self, gray_roi):
+        if not HAS_TESSERACT:
+            return None
         configs = [
             "--psm 7 -c tessedit_char_whitelist=0123456789.numkμµ ",
             "--psm 7",

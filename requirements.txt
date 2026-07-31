@@ -2,5 +2,8 @@ PyQt5>=5.15
 opencv-python-headless>=4.5
 numpy>=1.21
 matplotlib>=3.5
-pytesseract>=0.3.10
 openpyxl>=3.0
+
+# Optional: 스케일바 자동 OCR 인식용 (없어도 수동 입력으로 동작)
+# pip install pytesseract
+# + Tesseract OCR 바이너리 설치 필요

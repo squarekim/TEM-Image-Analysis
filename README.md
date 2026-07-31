@@ -17,10 +17,22 @@ TEM(투과전자현미경) 이미지에서 구형 입자를 자동으로 검출�
 pip install -r requirements.txt
 ```
 
-Tesseract OCR이 필요합니다:
+이것만으로 바로 실행 가능합니다. 스케일바는 수동으로 입력하면 됩니다.
+
+### (선택) 스케일바 자동 OCR 인식
+
+스케일바 텍스트를 자동으로 읽으려면 Tesseract OCR을 추가 설치하세요:
+
+```bash
+pip install pytesseract
+```
+
++ Tesseract 바이너리 설치:
 - Ubuntu/Debian: `sudo apt install tesseract-ocr`
 - macOS: `brew install tesseract`
-- Windows: https://github.com/UB-Mannheim/tesseract/wiki 에서 설치
+- Windows: [UB-Mannheim Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) 에서 설치
+
+설치하지 않아도 프로그램은 정상 동작하며, 수동 입력 모드로 자동 전환됩니다.
 
 ## 실행
 

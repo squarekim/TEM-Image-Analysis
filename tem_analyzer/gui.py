@@ -14,7 +14,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import openpyxl
 
-from .analyzer import ScaleBarDetector, ParticleAnalyzer
+from .analyzer import ScaleBarDetector, ParticleAnalyzer, HAS_TESSERACT
 
 
 class ImageLabel(QLabel):
@@ -125,11 +125,16 @@ class MainWindow(QMainWindow):
         scale_group = QGroupBox("스케일바 설정")
         scale_form = QFormLayout()
 
-        self.scale_status = QLabel("자동 감지 대기 중")
+        if HAS_TESSERACT:
+            self.scale_status = QLabel("자동 감지 대기 중")
+        else:
+            self.scale_status = QLabel("OCR 미설치 - 수동 입력 모드")
         scale_form.addRow("상태:", self.scale_status)
 
         self.chk_manual = QCheckBox("수동 입력 사용")
         self.chk_manual.toggled.connect(self._toggle_manual_scale)
+        if not HAS_TESSERACT:
+            self.chk_manual.setChecked(True)
         scale_form.addRow(self.chk_manual)
 
         self.spin_bar_px = QDoubleSpinBox()
