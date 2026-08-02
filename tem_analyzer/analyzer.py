@@ -175,9 +175,15 @@ class ParticleAnalyzer:
         if best is None:
             return []
 
+        blur3 = cv2.GaussianBlur(gray, (3, 3), 0)
+        gx = cv2.Sobel(blur3, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(blur3, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(gx ** 2 + gy ** 2)
+
         particles = []
         for cx, cy, r in best:
             cx, cy, r = int(cx), int(cy), int(r)
+            cx, cy, r = self._refine_circle(grad_mag, cx, cy, r, w, h)
             inside_x = max(0, min(cx + r, w) - max(cx - r, 0))
             inside_y = max(0, min(cy + r, h) - max(cy - r, 0))
             if inside_x < r or inside_y < r:
@@ -185,6 +191,27 @@ class ParticleAnalyzer:
             area_px = np.pi * r * r
             particles.append(self._measure_circle(cx, cy, r, area_px))
         return particles
+
+    @staticmethod
+    def _refine_circle(grad_mag, cx, cy, r, w, h, search=0.35, n_angles=72):
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        best = (cx, cy, r)
+        best_score = -1.0
+        r_lo, r_hi = max(3, int(r * (1 - search))), int(r * (1 + search))
+        for dx in (-2, 0, 2):
+            for dy in (-2, 0, 2):
+                for rr in range(r_lo, r_hi + 1):
+                    xs = (cx + dx + rr * cos_a).astype(int)
+                    ys = (cy + dy + rr * sin_a).astype(int)
+                    valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+                    if valid.sum() < n_angles * 0.6:
+                        continue
+                    score = np.median(grad_mag[ys[valid], xs[valid]])
+                    if score > best_score:
+                        best_score = score
+                        best = (cx + dx, cy + dy, rr)
+        return best
 
     @staticmethod
     def _radius_mode(radii):
