@@ -84,7 +84,8 @@ class ParticleAnalyzer:
         self.nm_per_px = nm_per_px
 
     def analyze(self, image, min_area_px=100, max_area_px=None,
-                circularity_thresh=0.5, use_watershed=True, hollow=False):
+                circularity_thresh=0.5, use_watershed=True, hollow=False,
+                detect_cores=False):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
         cutoff = self._find_scalebar_top(gray)
@@ -151,7 +152,63 @@ class ParticleAnalyzer:
                 kept.append(p)
             particles = kept
 
+        if detect_cores:
+            for p in particles:
+                has_core, core_r = self._detect_core(
+                    gray, p["center_x"], p["center_y"], int(p["radius_px"]))
+                p["has_core"] = has_core
+                p["core_radius_px"] = core_r
+                core_d_px = core_r * 2
+                p["core_diameter"] = (core_d_px * self.nm_per_px
+                                      if self.nm_per_px else core_d_px)
+
         return particles
+
+    @staticmethod
+    def _detect_core(gray, cx, cy, r):
+        h, w = gray.shape
+        ri = int(r * 0.75)
+        x0, x1 = max(0, cx - ri), min(w, cx + ri)
+        y0, y1 = max(0, cy - ri), min(h, cy + ri)
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            return False, 0.0
+        roi = gray[y0:y1, x0:x1]
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= ri * ri
+        vals = roi[mask]
+        if len(vals) < 30:
+            return False, 0.0
+
+        ring_vals = []
+        a = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+        for f in (0.88, 0.95):
+            xs = (cx + r * f * np.cos(a)).astype(int)
+            ys = (cy + r * f * np.sin(a)).astype(int)
+            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            ring_vals.extend(gray[ys[v], xs[v]])
+        rim = np.percentile(ring_vals, 25)
+
+        p10, p75 = np.percentile(vals, [10, 75])
+        if p75 - rim < 20:
+            return False, 0.0
+        if p75 - p10 < 25:
+            return False, 0.0
+
+        t = (p10 + p75) / 2
+        dark = ((roi < t) & mask).astype(np.uint8) * 255
+        dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return False, 0.0
+        cnt = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(cnt)
+        interior_area = np.pi * ri * ri
+        if area < interior_area * 0.04 or area > interior_area * 0.85:
+            return False, 0.0
+        (ccx, ccy), core_r = cv2.minEnclosingCircle(cnt)
+        if np.hypot(ccx + x0 - cx, ccy + y0 - cy) > r * 0.55:
+            return False, 0.0
+        return True, core_r
 
     def _detect_hough(self, gray, min_area_px):
         h, w = gray.shape
@@ -532,7 +589,7 @@ class ParticleAnalyzer:
             return {}
         diameters = np.array([p["diameter"] for p in particles])
         diameters_sorted = np.sort(diameters)
-        return {
+        stats = {
             "count": len(diameters),
             "mean": float(np.mean(diameters)),
             "std": float(np.std(diameters)),
@@ -542,3 +599,11 @@ class ParticleAnalyzer:
             "d50": float(np.percentile(diameters_sorted, 50)),
             "d90": float(np.percentile(diameters_sorted, 90)),
         }
+        if particles and "has_core" in particles[0]:
+            core_count = sum(1 for p in particles if p["has_core"])
+            stats["core_count"] = core_count
+            stats["core_ratio"] = core_count / len(particles)
+            core_diams = [p["core_diameter"] for p in particles if p["has_core"]]
+            if core_diams:
+                stats["core_mean"] = float(np.mean(core_diams))
+        return stats

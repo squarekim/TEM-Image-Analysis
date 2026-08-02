@@ -186,6 +186,11 @@ class MainWindow(QMainWindow):
         self.chk_hollow.setToolTip("속이 빈 입자 (실리카 등)의 링 형태를 채워서 검출")
         param_form.addRow(self.chk_hollow)
 
+        self.chk_core = QCheckBox("코어 검출 (Yolk-shell)")
+        self.chk_core.setChecked(False)
+        self.chk_core.setToolTip("중공 입자 내부의 코어 입자를 감지하고 보유 비율을 계산")
+        param_form.addRow(self.chk_core)
+
         param_group.setLayout(param_form)
         right_layout.addWidget(param_group)
 
@@ -199,6 +204,7 @@ class MainWindow(QMainWindow):
         self.lbl_d10 = QLabel("-")
         self.lbl_d50 = QLabel("-")
         self.lbl_d90 = QLabel("-")
+        self.lbl_core = QLabel("-")
         stats_form.addRow("입자 수:", self.lbl_count)
         stats_form.addRow("평균 직경:", self.lbl_mean)
         stats_form.addRow("표준편차:", self.lbl_std)
@@ -207,6 +213,7 @@ class MainWindow(QMainWindow):
         stats_form.addRow("D10:", self.lbl_d10)
         stats_form.addRow("D50:", self.lbl_d50)
         stats_form.addRow("D90:", self.lbl_d90)
+        stats_form.addRow("코어 보유율:", self.lbl_core)
         stats_group.setLayout(stats_form)
         right_layout.addWidget(stats_group)
 
@@ -284,6 +291,7 @@ class MainWindow(QMainWindow):
             circularity_thresh=self.spin_circularity.value(),
             use_watershed=self.chk_watershed.isChecked(),
             hollow=self.chk_hollow.isChecked(),
+            detect_cores=self.chk_core.isChecked(),
         )
 
         self._draw_results()
@@ -300,6 +308,8 @@ class MainWindow(QMainWindow):
             cx, cy = p["center_x"], p["center_y"]
             r = int(p["radius_px"])
             cv2.circle(display, (cx, cy), r, (0, 255, 0), 2)
+            if p.get("has_core"):
+                cv2.circle(display, (cx, cy), int(p["core_radius_px"]), (0, 165, 255), 2)
             cv2.putText(display, str(i + 1), (cx - 10, cy - r - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         self._display_image(display)
@@ -326,14 +336,31 @@ class MainWindow(QMainWindow):
         self.lbl_d10.setText(f"{stats['d10']:.2f} {u}")
         self.lbl_d50.setText(f"{stats['d50']:.2f} {u}")
         self.lbl_d90.setText(f"{stats['d90']:.2f} {u}")
+        if "core_ratio" in stats:
+            txt = f"{stats['core_count']}/{stats['count']} ({stats['core_ratio']*100:.1f}%)"
+            if "core_mean" in stats:
+                txt += f", 평균 {stats['core_mean']:.2f} {u}"
+            self.lbl_core.setText(txt)
+        else:
+            self.lbl_core.setText("-")
 
     def _update_table(self):
+        has_core_col = bool(self.particles) and "has_core" in self.particles[0]
+        if has_core_col:
+            self.table.setColumnCount(4)
+            self.table.setHorizontalHeaderLabels(["#", "직경", "면적", "코어"])
+        else:
+            self.table.setColumnCount(3)
+            self.table.setHorizontalHeaderLabels(["#", "직경", "면적"])
         self.table.setRowCount(len(self.particles))
         u = self.unit
         for i, p in enumerate(self.particles):
             self.table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
             self.table.setItem(i, 1, QTableWidgetItem(f"{p['diameter']:.2f} {u}"))
             self.table.setItem(i, 2, QTableWidgetItem(f"{p['area']:.2f} {u}²"))
+            if has_core_col:
+                core_txt = f"{p['core_diameter']:.2f} {u}" if p["has_core"] else "없음"
+                self.table.setItem(i, 3, QTableWidgetItem(core_txt))
 
     def _update_histogram(self):
         diameters = [p["diameter"] for p in self.particles]
@@ -355,10 +382,17 @@ class MainWindow(QMainWindow):
         ws_data.title = "Particle Data"
 
         u = self.unit
+        has_core = bool(self.particles) and "has_core" in self.particles[0]
         headers = ["#", f"Diameter ({u})", f"Area ({u}²)", "Center X (px)", "Center Y (px)"]
+        if has_core:
+            headers += ["Has Core", f"Core Diameter ({u})"]
         ws_data.append(headers)
         for i, p in enumerate(self.particles):
-            ws_data.append([i + 1, p["diameter"], p["area"], p["center_x"], p["center_y"]])
+            row = [i + 1, p["diameter"], p["area"], p["center_x"], p["center_y"]]
+            if has_core:
+                row += ["Y" if p["has_core"] else "N",
+                        p["core_diameter"] if p["has_core"] else None]
+            ws_data.append(row)
 
         ws_stats = wb.create_sheet("Statistics")
         stats = ParticleAnalyzer.compute_statistics(self.particles)
@@ -371,6 +405,11 @@ class MainWindow(QMainWindow):
         ws_stats.append(["D10", stats["d10"], u])
         ws_stats.append(["D50", stats["d50"], u])
         ws_stats.append(["D90", stats["d90"], u])
+        if "core_ratio" in stats:
+            ws_stats.append(["Core Count", stats["core_count"], ""])
+            ws_stats.append(["Core Ratio", stats["core_ratio"], ""])
+            if "core_mean" in stats:
+                ws_stats.append(["Core Mean Diameter", stats["core_mean"], u])
 
         if self.nm_per_px:
             ws_stats.append([])
