@@ -174,19 +174,8 @@ class ParticleAnalyzer:
         if len(vals) < 30:
             return False
 
-        ring_vals = []
-        a = np.linspace(0, 2 * np.pi, 48, endpoint=False)
-        for f in (0.88, 0.95):
-            xs = (cx + r * f * np.cos(a)).astype(int)
-            ys = (cy + r * f * np.sin(a)).astype(int)
-            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-            ring_vals.extend(gray[ys[v], xs[v]])
-        rim = np.percentile(ring_vals, 25)
-
         p10, p75 = np.percentile(vals, [10, 75])
-        if p75 - rim < 15:
-            return False
-        if p75 - p10 < 20:
+        if p75 - p10 < 12:
             return False
 
         t = (p10 + p75) / 2
@@ -284,10 +273,24 @@ class ParticleAnalyzer:
                 continue
             for scx, scy, sr in subs:
                 refined = self._ransac_refine(edge_pts, bg_mask, scx, scy, sr, w, h, rng)
-                if refined is not None:
+                if refined is not None and refined[2] <= med * 1.3:
                     scx, scy, sr = refined
                 result.append(self._measure_circle(scx, scy, sr, np.pi * sr * sr))
-        return result
+        return self._dedup(result, med)
+
+    @staticmethod
+    def _dedup(particles, med):
+        kept = []
+        for p in particles:
+            dup = False
+            for q in kept:
+                d = np.hypot(p["center_x"] - q["center_x"], p["center_y"] - q["center_y"])
+                if d < med * 0.7:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(p)
+        return kept
 
     @staticmethod
     def _rehough_region(blurred, cx, cy, r, med, w, h):
@@ -299,7 +302,7 @@ class ParticleAnalyzer:
             return None
         min_r = max(3, int(med * 0.7))
         max_r = int(med * 1.25)
-        for param2 in [30, 25, 20]:
+        for param2 in [30, 25, 20, 15]:
             circles = cv2.HoughCircles(
                 roi, cv2.HOUGH_GRADIENT, dp=1.2,
                 minDist=max(8, int(med * 1.2)),
@@ -310,9 +313,9 @@ class ParticleAnalyzer:
                 continue
             subs = []
             for scx, scy, sr in circles[0]:
-                gcx, gcy = int(scx) + x0, int(scy) + y0
-                if np.hypot(gcx - cx, gcy - cy) <= r:
-                    subs.append((gcx, gcy, int(sr)))
+                gcx, gcy = scx + x0, scy + y0
+                if np.hypot(gcx - cx, gcy - cy) <= r * 1.1:
+                    subs.append((int(round(gcx)), int(round(gcy)), int(round(sr))))
             if len(subs) >= 2:
                 return subs
         return None
@@ -385,21 +388,27 @@ class ParticleAnalyzer:
                 continue
             dd = np.abs(np.hypot(sel[:, 0] - ux, sel[:, 1] - uy) - r)
             inliers = np.sum(dd < tol)
-            score = inliers * (1.0 - self._bg_fraction(bg_mask, int(ux), int(uy), int(r), w, h)) ** 2
+            bg_frac = self._bg_fraction(bg_mask, int(ux), int(uy), int(r), w, h)
+            if bg_frac > 0.15:
+                continue
+            score = inliers * (1.0 - bg_frac) ** 2
             if score > best_score:
                 best_score = score
-                best = (ux, uy, r)
+                best = (ux, uy, r, bg_frac)
         if best is None:
             return None
-        ux, uy, r = best
+        ux, uy, r, best_bg = best
         dd = np.abs(np.hypot(sel[:, 0] - ux, sel[:, 1] - uy) - r)
         pts = sel[dd < tol].astype(np.float64)
         if len(pts) >= 6:
             A = np.column_stack([2 * pts[:, 0], 2 * pts[:, 1], np.ones(len(pts))])
             b = pts[:, 0] ** 2 + pts[:, 1] ** 2
             sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-            ux, uy = sol[0], sol[1]
-            r = np.sqrt(sol[2] + ux * ux + uy * uy)
+            fx, fy = sol[0], sol[1]
+            fr = np.sqrt(sol[2] + fx * fx + fy * fy)
+            refit_bg = self._bg_fraction(bg_mask, int(fx), int(fy), int(fr), w, h)
+            if refit_bg <= best_bg + 0.05:
+                ux, uy, r = fx, fy, fr
         return int(round(ux)), int(round(uy)), int(round(r))
 
     @staticmethod
