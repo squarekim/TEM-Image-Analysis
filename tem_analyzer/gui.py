@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
         self.image = None
         self.original_image = None
         self.particles = []
+        self.result_image = None
         self.nm_per_px = None
         self.scale_text = None
         self.unit = "nm"
@@ -111,6 +112,12 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(False)
         self.btn_export.clicked.connect(self._export_excel)
         btn_layout.addWidget(self.btn_export)
+
+        self.btn_save_image = QPushButton("결과 이미지 저장")
+        self.btn_save_image.setMinimumHeight(36)
+        self.btn_save_image.setEnabled(False)
+        self.btn_save_image.clicked.connect(self._save_result_image)
+        btn_layout.addWidget(self.btn_save_image)
         left_layout.addLayout(btn_layout)
 
         self.image_label = ImageLabel()
@@ -314,30 +321,52 @@ class MainWindow(QMainWindow):
         return [p for p in self.particles if not p.get("excluded")]
 
     def _draw_results(self):
-        display = self.original_image.copy()
+        h, w = self.original_image.shape[:2]
+        scale = max(1, int(round(900 / max(h, w))))
+        display = cv2.resize(self.original_image, None, fx=scale, fy=scale,
+                             interpolation=cv2.INTER_CUBIC) if scale > 1 else self.original_image.copy()
+        thickness = max(2, scale)
         num = 0
         for p in self.particles:
-            cx, cy = p["center_x"], p["center_y"]
-            r = int(p["radius_px"])
+            cx, cy = p["center_x"] * scale, p["center_y"] * scale
+            r = int(p["radius_px"]) * scale
             excluded = p.get("excluded", False)
             if excluded:
                 color = (0, 0, 255)
             elif p.get("approx"):
-                color = (0, 255, 255)
+                color = (0, 220, 220)
             else:
-                color = (0, 255, 0)
+                color = (0, 220, 0)
             if p.get("contour") is not None:
-                self._draw_boundary(display, p["contour"], r, color, 3)
+                scaled_cnt = (p["contour"].astype(np.int32) * scale)
+                self._draw_boundary(display, scaled_cnt, r, color, thickness)
             else:
-                cv2.circle(display, (cx, cy), r, color, 3)
+                cv2.circle(display, (cx, cy), r, color, thickness)
             if excluded:
                 continue
             num += 1
             if p.get("has_core"):
                 cv2.drawMarker(display, (cx, cy), (0, 165, 255),
-                               cv2.MARKER_CROSS, max(8, r // 2), 2)
-            cv2.putText(display, str(num), (cx - 10, cy - r - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                               cv2.MARKER_CROSS, max(10, r // 3), thickness)
+            txt = str(num)
+            pos = (cx - 8 * len(txt), cy - 6)
+            font_scale = 0.45 + 0.1 * scale
+            cv2.putText(display, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, (0, 0, 0), 3)
+            cv2.putText(display, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, (80, 255, 255), 1)
+
+        legend = [("OK", (0, 220, 0)), ("Approx", (0, 220, 220)), ("Excluded", (0, 0, 255))]
+        lx = 10
+        for label, color in legend:
+            cv2.rectangle(display, (lx, 10), (lx + 18, 28), color, -1)
+            cv2.putText(display, label, (lx + 24, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 0, 0), 3)
+            cv2.putText(display, label, (lx + 24, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (255, 255, 255), 1)
+            lx += 24 + 13 * len(label) + 16
+        self.result_image = display
+        self.btn_save_image.setEnabled(True)
         self._display_image(display)
 
     @staticmethod
@@ -360,6 +389,18 @@ class MainWindow(QMainWindow):
             if len(seg) >= 2:
                 cv2.polylines(display, [np.array(seg, np.int32).reshape(-1, 1, 2)],
                               False, color, thickness)
+
+    def _save_result_image(self):
+        if self.result_image is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "결과 이미지 저장", "particle_result.png",
+            "PNG 이미지 (*.png);;JPEG 이미지 (*.jpg)"
+        )
+        if not path:
+            return
+        cv2.imwrite(path, self.result_image)
+        self.statusBar().showMessage(f"결과 이미지 저장 완료: {path}")
 
     def _display_image(self, cv_img):
         if len(cv_img.shape) == 2:
@@ -460,6 +501,17 @@ class MainWindow(QMainWindow):
         if self.nm_per_px:
             ws_stats.append([])
             ws_stats.append(["Scale", f"{self.nm_per_px:.4f}", "nm/px"])
+
+        if self.result_image is not None:
+            try:
+                import tempfile
+                from openpyxl.drawing.image import Image as XLImage
+                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                cv2.imwrite(tmp.name, self.result_image)
+                ws_img = wb.create_sheet("Result Image")
+                ws_img.add_image(XLImage(tmp.name), "A1")
+            except Exception:
+                pass
 
         wb.save(path)
         self.statusBar().showMessage(f"Excel 저장 완료: {path}")
