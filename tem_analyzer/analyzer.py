@@ -143,27 +143,33 @@ class ParticleAnalyzer:
     def _detect_hough(self, gray, min_area_px):
         h, w = gray.shape
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.5)
-        min_r = max(10, int(np.sqrt(min_area_px / np.pi)))
-        max_r = min(h, w) // 3
-        min_dist = max(30, min_r * 3)
+        min_r = max(5, int(np.sqrt(min_area_px / np.pi)))
+        max_r = min(h, w) // 4
+        min_dist = max(15, min_r * 2)
 
         for param2 in [45, 40, 35, 30]:
             circles = cv2.HoughCircles(
                 blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_dist,
                 param1=80, param2=param2, minRadius=min_r, maxRadius=max_r
             )
-            if circles is not None and len(circles[0]) >= 3:
-                particles = []
-                for cx, cy, r in circles[0]:
-                    cx, cy, r = int(cx), int(cy), int(r)
-                    inside_x = max(0, min(cx + r, w) - max(cx - r, 0))
-                    inside_y = max(0, min(cy + r, h) - max(cy - r, 0))
-                    if inside_x < r or inside_y < r:
-                        continue
-                    area_px = np.pi * r * r
-                    p = self._measure_circle(cx, cy, r, area_px)
-                    particles.append(p)
-                return particles
+            if circles is None or len(circles[0]) < 3:
+                continue
+
+            radii = circles[0][:, 2]
+            median_r = np.median(radii)
+            particles = []
+            for cx, cy, r in circles[0]:
+                cx, cy, r = int(cx), int(cy), int(r)
+                if r > median_r * 1.8:
+                    continue
+                inside_x = max(0, min(cx + r, w) - max(cx - r, 0))
+                inside_y = max(0, min(cy + r, h) - max(cy - r, 0))
+                if inside_x < r or inside_y < r:
+                    continue
+                area_px = np.pi * r * r
+                p = self._measure_circle(cx, cy, r, area_px)
+                particles.append(p)
+            return particles
 
         return []
 
