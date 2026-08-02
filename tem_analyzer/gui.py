@@ -24,6 +24,7 @@ class ImageLabel(QLabel):
         self.setMinimumSize(400, 400)
         self.setStyleSheet("border: 1px solid #ccc; background: #222;")
         self._pixmap = None
+        self.click_callback = None
 
     def set_image(self, pixmap):
         self._pixmap = pixmap
@@ -39,6 +40,21 @@ class ImageLabel(QLabel):
     def resizeEvent(self, event):
         self._update_display()
         super().resizeEvent(event)
+
+    def mousePressEvent(self, event):
+        if self._pixmap and self.click_callback:
+            scaled = self._pixmap.scaled(
+                self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            off_x = (self.width() - scaled.width()) / 2
+            off_y = (self.height() - scaled.height()) / 2
+            px = event.pos().x() - off_x
+            py = event.pos().y() - off_y
+            if 0 <= px < scaled.width() and 0 <= py < scaled.height():
+                ix = px * self._pixmap.width() / scaled.width()
+                iy = py * self._pixmap.height() / scaled.height()
+                self.click_callback(ix, iy)
+        super().mousePressEvent(event)
 
 
 class HistogramCanvas(FigureCanvas):
@@ -121,6 +137,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(btn_layout)
 
         self.image_label = ImageLabel()
+        self.image_label.click_callback = self._on_image_click
         left_layout.addWidget(self.image_label, stretch=3)
 
         self.histogram = HistogramCanvas()
@@ -323,6 +340,7 @@ class MainWindow(QMainWindow):
     def _draw_results(self):
         h, w = self.original_image.shape[:2]
         scale = max(1, int(round(900 / max(h, w))))
+        self._result_scale = scale
         display = cv2.resize(self.original_image, None, fx=scale, fy=scale,
                              interpolation=cv2.INTER_CUBIC) if scale > 1 else self.original_image.copy()
         thickness = max(2, scale)
@@ -389,6 +407,30 @@ class MainWindow(QMainWindow):
             if len(seg) >= 2:
                 cv2.polylines(display, [np.array(seg, np.int32).reshape(-1, 1, 2)],
                               False, color, thickness)
+
+    def _on_image_click(self, ix, iy):
+        if not self.particles or "has_core" not in (self.particles[0] if self.particles else {}):
+            return
+        scale = getattr(self, "_result_scale", 1)
+        ox, oy = ix / scale, iy / scale
+        best = None
+        best_d = None
+        for p in self.particles:
+            if p.get("excluded"):
+                continue
+            d = np.hypot(p["center_x"] - ox, p["center_y"] - oy)
+            if d <= p["radius_px"] and (best_d is None or d < best_d):
+                best = p
+                best_d = d
+        if best is None:
+            return
+        best["has_core"] = not best["has_core"]
+        self._draw_results()
+        stats = ParticleAnalyzer.compute_statistics(self.particles)
+        self._update_stats(stats)
+        self._update_table()
+        state = "체크" if best["has_core"] else "해제"
+        self.statusBar().showMessage(f"코어 {state}: ({best['center_x']}, {best['center_y']}) 입자")
 
     def _save_result_image(self):
         if self.result_image is None:
