@@ -307,13 +307,37 @@ class MainWindow(QMainWindow):
         for i, p in enumerate(self.particles):
             cx, cy = p["center_x"], p["center_y"]
             r = int(p["radius_px"])
-            cv2.circle(display, (cx, cy), r, (0, 255, 0), 2)
+            if p.get("contour") is not None:
+                self._draw_boundary(display, p["contour"], r, (0, 255, 0), 2)
+            else:
+                cv2.circle(display, (cx, cy), r, (0, 255, 0), 2)
             if p.get("has_core"):
                 cv2.drawMarker(display, (cx, cy), (0, 165, 255),
                                cv2.MARKER_CROSS, max(8, r // 2), 2)
             cv2.putText(display, str(i + 1), (cx - 10, cy - r - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         self._display_image(display)
+
+    @staticmethod
+    def _draw_boundary(display, contour, r, color, thickness):
+        pts = contour.reshape(-1, 2)
+        max_gap = max(6, r * 0.35)
+        segment = [pts[0]]
+        segments = []
+        for q in pts[1:]:
+            if np.hypot(q[0] - segment[-1][0], q[1] - segment[-1][1]) <= max_gap:
+                segment.append(q)
+            else:
+                segments.append(segment)
+                segment = [q]
+        if np.hypot(pts[0][0] - segment[-1][0], pts[0][1] - segment[-1][1]) <= max_gap and segments:
+            segments[0] = segment + segments[0]
+        else:
+            segments.append(segment)
+        for seg in segments:
+            if len(seg) >= 2:
+                cv2.polylines(display, [np.array(seg, np.int32).reshape(-1, 1, 2)],
+                              False, color, thickness)
 
     def _display_image(self, cv_img):
         if len(cv_img.shape) == 2:

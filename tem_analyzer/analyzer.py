@@ -227,56 +227,98 @@ class ParticleAnalyzer:
         if best is None:
             return []
 
+        seeds = [(int(cx), int(cy), int(r)) for cx, cy, r in best]
+        med = float(np.median([s[2] for s in seeds]))
+
+        expanded = []
+        for cx, cy, r in seeds:
+            if r > med * 1.35:
+                subs = self._rehough_region(blurred, cx, cy, r, med, w, h)
+                if subs and len(subs) >= 2:
+                    expanded.extend(subs)
+                    continue
+            expanded.append((cx, cy, r))
+
         blur3 = cv2.GaussianBlur(gray, (3, 3), 0)
         gx = cv2.Sobel(blur3, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(blur3, cv2.CV_32F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(gx ** 2 + gy ** 2)
 
-        edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 1.2), 40, 120)
-        eys, exs = np.nonzero(edges)
-        edge_pts = np.column_stack([exs, eys])
-        bg_mask = self._background_mask(blur3, best)
-        rng = np.random.default_rng(0)
+        traces = []
+        all_scores = []
+        for cx, cy, r in expanded:
+            trace = self._trace_boundary(gx, gy, cx, cy, r, w, h)
+            traces.append(trace)
+            all_scores.extend(trace[2][trace[2] > 0])
+        if not all_scores:
+            return []
+        score_thresh = np.percentile(all_scores, 30)
 
         particles = []
-        for cx, cy, r in best:
-            cx, cy, r = int(cx), int(cy), int(r)
-            refined = self._ransac_refine(edge_pts, bg_mask, cx, cy, r, w, h, rng)
-            if refined is not None:
-                cx, cy, r = refined
-            else:
-                cx, cy, r = self._refine_circle(grad_mag, cx, cy, r, w, h)
-            inside_x = max(0, min(cx + r, w) - max(cx - r, 0))
-            inside_y = max(0, min(cy + r, h) - max(cy - r, 0))
-            if inside_x < r or inside_y < r:
+        for (cx, cy, r), (angles, r_ang, s_ang) in zip(expanded, traces):
+            fit = self._robust_circle_fit(cx, cy, angles, r_ang, s_ang, score_thresh)
+            if fit is None:
                 continue
-            area_px = np.pi * r * r
-            particles.append(self._measure_circle(cx, cy, r, area_px))
+            ux, uy, rr, coverage, rms, pts = fit
+            if coverage < 0.5 or rms > 0.10:
+                continue
+            ux, uy, rr = int(round(ux)), int(round(uy)), rr
+            inside_x = max(0, min(ux + rr, w) - max(ux - rr, 0))
+            inside_y = max(0, min(uy + rr, h) - max(uy - rr, 0))
+            if inside_x < rr or inside_y < rr:
+                continue
+            p = self._measure_circle(ux, uy, rr, np.pi * rr * rr)
+            p["contour"] = pts.reshape(-1, 1, 2).astype(np.int32)
+            particles.append(p)
 
-        particles = self._split_oversized(particles, blurred, edge_pts, bg_mask, w, h, rng)
-        return particles
+        return self._dedup(particles, med)
 
-    def _split_oversized(self, particles, blurred, edge_pts, bg_mask, w, h, rng):
-        if len(particles) < 5:
-            return particles
-        radii = np.array([p["radius_px"] for p in particles])
-        med = np.median(radii)
-        result = []
-        for p in particles:
-            cx, cy, r = p["center_x"], p["center_y"], int(p["radius_px"])
-            if r <= med * 1.35:
-                result.append(p)
+    @staticmethod
+    def _trace_boundary(gx, gy, cx, cy, r0, w, h, n_angles=96):
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        radii = np.arange(max(2, r0 * 0.55), r0 * 1.5, 0.5)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        r_best = np.full(n_angles, np.nan)
+        s_best = np.zeros(n_angles)
+        for i in range(n_angles):
+            xs = (cx + radii * cos_a[i]).astype(int)
+            ys = (cy + radii * sin_a[i]).astype(int)
+            valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            if valid.sum() < len(radii) * 0.5:
                 continue
-            subs = self._rehough_region(blurred, cx, cy, r, med, w, h)
-            if not subs or len(subs) < 2:
-                result.append(p)
-                continue
-            for scx, scy, sr in subs:
-                refined = self._ransac_refine(edge_pts, bg_mask, scx, scy, sr, w, h, rng)
-                if refined is not None and refined[2] <= med * 1.3:
-                    scx, scy, sr = refined
-                result.append(self._measure_circle(scx, scy, sr, np.pi * sr * sr))
-        return self._dedup(result, med)
+            outward = (gx[ys[valid], xs[valid]] * cos_a[i]
+                       + gy[ys[valid], xs[valid]] * sin_a[i])
+            j = np.argmax(outward)
+            s_best[i] = outward[j]
+            r_best[i] = radii[valid][j]
+        return angles, r_best, s_best
+
+    @staticmethod
+    def _robust_circle_fit(cx, cy, angles, r_ang, s_ang, score_thresh):
+        good = (s_ang > score_thresh) & ~np.isnan(r_ang)
+        coverage = good.mean()
+        if good.sum() < 8:
+            return None
+        xs = cx + r_ang[good] * np.cos(angles[good])
+        ys = cy + r_ang[good] * np.sin(angles[good])
+        pts = np.column_stack([xs, ys])
+        ux, uy, r = cx, cy, np.median(r_ang[good])
+        for _ in range(3):
+            A = np.column_stack([2 * pts[:, 0], 2 * pts[:, 1], np.ones(len(pts))])
+            b = pts[:, 0] ** 2 + pts[:, 1] ** 2
+            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+            ux, uy = sol[0], sol[1]
+            r = np.sqrt(sol[2] + ux * ux + uy * uy)
+            resid = np.abs(np.hypot(pts[:, 0] - ux, pts[:, 1] - uy) - r)
+            mad = np.median(resid) + 1e-6
+            keep = resid < 3 * mad + 1
+            if keep.all():
+                break
+            pts = pts[keep]
+            if len(pts) < 8:
+                break
+        resid = np.abs(np.hypot(pts[:, 0] - ux, pts[:, 1] - uy) - r)
+        rms = np.sqrt(np.mean(resid ** 2)) / max(r, 1)
+        return ux, uy, r, coverage, rms, pts
 
     @staticmethod
     def _dedup(particles, med):
@@ -319,118 +361,6 @@ class ParticleAnalyzer:
             if len(subs) >= 2:
                 return subs
         return None
-
-    @staticmethod
-    def _background_mask(blur, circles):
-        h, w = blur.shape
-        interior = []
-        for cx, cy, r in circles:
-            ri = max(1, int(r * 0.5))
-            a = np.linspace(0, 2 * np.pi, 24, endpoint=False)
-            xs = (cx + ri * np.cos(a)).astype(int)
-            ys = (cy + ri * np.sin(a)).astype(int)
-            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-            interior.extend(blur[ys[v], xs[v]])
-        particle_level = np.median(interior) if interior else 0
-        bg_level = np.percentile(blur, 95)
-        if bg_level - particle_level < 15:
-            return np.zeros_like(blur, dtype=np.float32)
-        return (blur > (particle_level + bg_level) / 2).astype(np.float32)
-
-    @staticmethod
-    def _bg_fraction(bg_mask, cx, cy, r, w, h):
-        total, count = 0.0, 0
-        for f in (0.3, 0.5, 0.7, 0.85):
-            ri = max(1, int(r * f))
-            n = max(8, int(2 * np.pi * ri / 3))
-            a = np.linspace(0, 2 * np.pi, n, endpoint=False)
-            xs = (cx + ri * np.cos(a)).astype(int)
-            ys = (cy + ri * np.sin(a)).astype(int)
-            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-            total += bg_mask[ys[v], xs[v]].sum()
-            count += v.sum()
-        return total / max(count, 1)
-
-    @staticmethod
-    def _circle_from_3pts(p1, p2, p3):
-        ax, ay = p1
-        bx, by = p2
-        cx, cy = p3
-        d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
-        if abs(d) < 1e-6:
-            return None
-        ux = ((ax * ax + ay * ay) * (by - cy) + (bx * bx + by * by) * (cy - ay)
-              + (cx * cx + cy * cy) * (ay - by)) / d
-        uy = ((ax * ax + ay * ay) * (cx - bx) + (bx * bx + by * by) * (ax - cx)
-              + (cx * cx + cy * cy) * (bx - ax)) / d
-        return ux, uy, np.hypot(ax - ux, ay - uy)
-
-    def _ransac_refine(self, edge_pts, bg_mask, cx, cy, r0, w, h, rng,
-                       n_iter=400, tol=2.0):
-        if len(edge_pts) == 0:
-            return None
-        d = np.hypot(edge_pts[:, 0] - cx, edge_pts[:, 1] - cy)
-        sel = edge_pts[(d > r0 * 0.6) & (d < r0 * 1.45)]
-        if len(sel) < 10:
-            return None
-        best = None
-        best_score = -1.0
-        n = len(sel)
-        for _ in range(n_iter):
-            idx = rng.choice(n, 3, replace=False)
-            c = self._circle_from_3pts(sel[idx[0]], sel[idx[1]], sel[idx[2]])
-            if c is None:
-                continue
-            ux, uy, r = c
-            if not (r0 * 0.7 <= r <= r0 * 1.4):
-                continue
-            if np.hypot(ux - cx, uy - cy) > r0 * 0.45:
-                continue
-            dd = np.abs(np.hypot(sel[:, 0] - ux, sel[:, 1] - uy) - r)
-            inliers = np.sum(dd < tol)
-            bg_frac = self._bg_fraction(bg_mask, int(ux), int(uy), int(r), w, h)
-            if bg_frac > 0.15:
-                continue
-            score = inliers * (1.0 - bg_frac) ** 2
-            if score > best_score:
-                best_score = score
-                best = (ux, uy, r, bg_frac)
-        if best is None:
-            return None
-        ux, uy, r, best_bg = best
-        dd = np.abs(np.hypot(sel[:, 0] - ux, sel[:, 1] - uy) - r)
-        pts = sel[dd < tol].astype(np.float64)
-        if len(pts) >= 6:
-            A = np.column_stack([2 * pts[:, 0], 2 * pts[:, 1], np.ones(len(pts))])
-            b = pts[:, 0] ** 2 + pts[:, 1] ** 2
-            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-            fx, fy = sol[0], sol[1]
-            fr = np.sqrt(sol[2] + fx * fx + fy * fy)
-            refit_bg = self._bg_fraction(bg_mask, int(fx), int(fy), int(fr), w, h)
-            if refit_bg <= best_bg + 0.05:
-                ux, uy, r = fx, fy, fr
-        return int(round(ux)), int(round(uy)), int(round(r))
-
-    @staticmethod
-    def _refine_circle(grad_mag, cx, cy, r, w, h, search=0.35, n_angles=72):
-        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
-        cos_a, sin_a = np.cos(angles), np.sin(angles)
-        best = (cx, cy, r)
-        best_score = -1.0
-        r_lo, r_hi = max(3, int(r * (1 - search))), int(r * (1 + search))
-        for dx in (-2, 0, 2):
-            for dy in (-2, 0, 2):
-                for rr in range(r_lo, r_hi + 1):
-                    xs = (cx + dx + rr * cos_a).astype(int)
-                    ys = (cy + dy + rr * sin_a).astype(int)
-                    valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-                    if valid.sum() < n_angles * 0.6:
-                        continue
-                    score = np.median(grad_mag[ys[valid], xs[valid]])
-                    if score > best_score:
-                        best_score = score
-                        best = (cx + dx, cy + dy, rr)
-        return best
 
     @staticmethod
     def _radius_mode(radii):
