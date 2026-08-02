@@ -299,23 +299,37 @@ class MainWindow(QMainWindow):
         self._update_stats(stats)
         self._update_table()
         self._update_histogram()
-        self.btn_export.setEnabled(bool(self.particles))
-        self.statusBar().showMessage(f"분석 완료: {len(self.particles)}개 입자 검출")
+        valid = self._valid_particles()
+        self.btn_export.setEnabled(bool(valid))
+        n_exc = len(self.particles) - len(valid)
+        msg = f"분석 완료: {len(valid)}개 입자 검출"
+        if n_exc:
+            msg += f" (비구형/판별불가 {n_exc}개 제외)"
+        self.statusBar().showMessage(msg)
+
+    def _valid_particles(self):
+        return [p for p in self.particles if not p.get("excluded")]
 
     def _draw_results(self):
         display = self.original_image.copy()
-        for i, p in enumerate(self.particles):
+        num = 0
+        for p in self.particles:
             cx, cy = p["center_x"], p["center_y"]
             r = int(p["radius_px"])
+            excluded = p.get("excluded", False)
+            color = (0, 0, 255) if excluded else (0, 255, 0)
             if p.get("contour") is not None:
-                self._draw_boundary(display, p["contour"], r, (0, 255, 0), 2)
+                self._draw_boundary(display, p["contour"], r, color, 3)
             else:
-                cv2.circle(display, (cx, cy), r, (0, 255, 0), 2)
+                cv2.circle(display, (cx, cy), r, color, 3)
+            if excluded:
+                continue
+            num += 1
             if p.get("has_core"):
                 cv2.drawMarker(display, (cx, cy), (0, 165, 255),
                                cv2.MARKER_CROSS, max(8, r // 2), 2)
-            cv2.putText(display, str(i + 1), (cx - 10, cy - r - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.putText(display, str(num), (cx - 10, cy - r - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         self._display_image(display)
 
     @staticmethod
@@ -368,16 +382,17 @@ class MainWindow(QMainWindow):
             self.lbl_core.setText("-")
 
     def _update_table(self):
-        has_core_col = bool(self.particles) and "has_core" in self.particles[0]
+        particles = self._valid_particles()
+        has_core_col = bool(particles) and "has_core" in particles[0]
         if has_core_col:
             self.table.setColumnCount(4)
             self.table.setHorizontalHeaderLabels(["#", "직경", "면적", "코어"])
         else:
             self.table.setColumnCount(3)
             self.table.setHorizontalHeaderLabels(["#", "직경", "면적"])
-        self.table.setRowCount(len(self.particles))
+        self.table.setRowCount(len(particles))
         u = self.unit
-        for i, p in enumerate(self.particles):
+        for i, p in enumerate(particles):
             self.table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
             self.table.setItem(i, 1, QTableWidgetItem(f"{p['diameter']:.2f} {u}"))
             self.table.setItem(i, 2, QTableWidgetItem(f"{p['area']:.2f} {u}²"))
@@ -385,7 +400,7 @@ class MainWindow(QMainWindow):
                 self.table.setItem(i, 3, QTableWidgetItem("유" if p["has_core"] else "무"))
 
     def _update_histogram(self):
-        diameters = [p["diameter"] for p in self.particles]
+        diameters = [p["diameter"] for p in self._valid_particles()]
         self.histogram.plot(diameters, self.unit)
 
     def _export_excel(self):
@@ -404,12 +419,13 @@ class MainWindow(QMainWindow):
         ws_data.title = "Particle Data"
 
         u = self.unit
-        has_core = bool(self.particles) and "has_core" in self.particles[0]
+        particles = self._valid_particles()
+        has_core = bool(particles) and "has_core" in particles[0]
         headers = ["#", f"Diameter ({u})", f"Area ({u}²)", "Center X (px)", "Center Y (px)"]
         if has_core:
             headers += ["Has Core"]
         ws_data.append(headers)
-        for i, p in enumerate(self.particles):
+        for i, p in enumerate(particles):
             row = [i + 1, p["diameter"], p["area"], p["center_x"], p["center_y"]]
             if has_core:
                 row += ["Y" if p["has_core"] else "N"]

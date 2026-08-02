@@ -126,18 +126,19 @@ class ParticleAnalyzer:
 
         if not hollow:
             hough_particles = self._detect_hough(analysis_region, min_area_px)
-            if hough_particles and particles:
+            hough_valid = [p for p in hough_particles if not p.get("excluded")]
+            if hough_valid and particles:
                 px_areas = [np.pi * p["radius_px"] ** 2 for p in particles]
-                hough_areas = [np.pi * p["radius_px"] ** 2 for p in hough_particles]
+                hough_areas = [np.pi * p["radius_px"] ** 2 for p in hough_valid]
                 contour_median = np.median(px_areas)
                 hough_median = np.median(hough_areas)
                 if hough_median > contour_median * 3:
                     particles = hough_particles
-                elif len(hough_particles) > len(particles) * 1.5:
+                elif len(hough_valid) > len(particles) * 1.5:
                     particles = hough_particles
                 elif len(particles) < 3:
                     particles = hough_particles
-            elif hough_particles and not particles:
+            elif hough_valid and not particles:
                 particles = hough_particles
 
         if scalebar_rect:
@@ -154,8 +155,11 @@ class ParticleAnalyzer:
 
         if detect_cores:
             for p in particles:
-                p["has_core"] = self._detect_core(
-                    gray, p["center_x"], p["center_y"], int(p["radius_px"]))
+                if p.get("excluded"):
+                    p["has_core"] = False
+                else:
+                    p["has_core"] = self._detect_core(
+                        gray, p["center_x"], p["center_y"], int(p["radius_px"]))
 
         return particles
 
@@ -259,8 +263,6 @@ class ParticleAnalyzer:
             if fit is None:
                 continue
             ux, uy, rr, coverage, rms, pts = fit
-            if coverage < 0.5 or rms > 0.10:
-                continue
             ux, uy, rr = int(round(ux)), int(round(uy)), rr
             inside_x = max(0, min(ux + rr, w) - max(ux - rr, 0))
             inside_y = max(0, min(uy + rr, h) - max(uy - rr, 0))
@@ -268,8 +270,10 @@ class ParticleAnalyzer:
                 continue
             p = self._measure_circle(ux, uy, rr, np.pi * rr * rr)
             p["contour"] = pts.reshape(-1, 1, 2).astype(np.int32)
+            p["excluded"] = coverage < 0.5 or rms > 0.10
             particles.append(p)
 
+        particles.sort(key=lambda p: p.get("excluded", False))
         return self._dedup(particles, med)
 
     @staticmethod
@@ -569,6 +573,8 @@ class ParticleAnalyzer:
 
     @staticmethod
     def compute_statistics(particles):
+        excluded_count = sum(1 for p in particles if p.get("excluded"))
+        particles = [p for p in particles if not p.get("excluded")]
         if not particles:
             return {}
         diameters = np.array([p["diameter"] for p in particles])
@@ -582,6 +588,7 @@ class ParticleAnalyzer:
             "d10": float(np.percentile(diameters_sorted, 10)),
             "d50": float(np.percentile(diameters_sorted, 50)),
             "d90": float(np.percentile(diameters_sorted, 90)),
+            "excluded": excluded_count,
         }
         if particles and "has_core" in particles[0]:
             core_count = sum(1 for p in particles if p["has_core"])
