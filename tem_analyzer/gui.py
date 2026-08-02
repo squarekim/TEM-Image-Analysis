@@ -302,9 +302,12 @@ class MainWindow(QMainWindow):
         valid = self._valid_particles()
         self.btn_export.setEnabled(bool(valid))
         n_exc = len(self.particles) - len(valid)
+        n_approx = sum(1 for p in valid if p.get("approx"))
         msg = f"분석 완료: {len(valid)}개 입자 검출"
+        if n_approx:
+            msg += f" (근사 {n_approx}개 포함)"
         if n_exc:
-            msg += f" (비구형/판별불가 {n_exc}개 제외)"
+            msg += f", 판별불가 {n_exc}개 제외"
         self.statusBar().showMessage(msg)
 
     def _valid_particles(self):
@@ -317,7 +320,12 @@ class MainWindow(QMainWindow):
             cx, cy = p["center_x"], p["center_y"]
             r = int(p["radius_px"])
             excluded = p.get("excluded", False)
-            color = (0, 0, 255) if excluded else (0, 255, 0)
+            if excluded:
+                color = (0, 0, 255)
+            elif p.get("approx"):
+                color = (0, 255, 255)
+            else:
+                color = (0, 255, 0)
             if p.get("contour") is not None:
                 self._draw_boundary(display, p["contour"], r, color, 3)
             else:
@@ -393,7 +401,8 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(particles))
         u = self.unit
         for i, p in enumerate(particles):
-            self.table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+            num = str(i + 1) + (" (근사)" if p.get("approx") else "")
+            self.table.setItem(i, 0, QTableWidgetItem(num))
             self.table.setItem(i, 1, QTableWidgetItem(f"{p['diameter']:.2f} {u}"))
             self.table.setItem(i, 2, QTableWidgetItem(f"{p['area']:.2f} {u}²"))
             if has_core_col:
@@ -422,11 +431,13 @@ class MainWindow(QMainWindow):
         particles = self._valid_particles()
         has_core = bool(particles) and "has_core" in particles[0]
         headers = ["#", f"Diameter ({u})", f"Area ({u}²)", "Center X (px)", "Center Y (px)"]
+        headers += ["Approx"]
         if has_core:
             headers += ["Has Core"]
         ws_data.append(headers)
         for i, p in enumerate(particles):
             row = [i + 1, p["diameter"], p["area"], p["center_x"], p["center_y"]]
+            row += ["Y" if p.get("approx") else "N"]
             if has_core:
                 row += ["Y" if p["has_core"] else "N"]
             ws_data.append(row)

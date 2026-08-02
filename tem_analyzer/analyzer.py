@@ -264,16 +264,21 @@ class ParticleAnalyzer:
                 continue
             ux, uy, rr, coverage, rms, pts = fit
             ux, uy, rr = int(round(ux)), int(round(uy)), rr
-            inside_x = max(0, min(ux + rr, w) - max(ux - rr, 0))
-            inside_y = max(0, min(uy + rr, h) - max(uy - rr, 0))
-            if inside_x < rr or inside_y < rr:
-                continue
             p = self._measure_circle(ux, uy, rr, np.pi * rr * rr)
             p["contour"] = pts.reshape(-1, 1, 2).astype(np.int32)
-            p["excluded"] = coverage < 0.5 or rms > 0.10
+            center_inside = 4 <= ux <= w - 4 and 4 <= uy <= h - 4
+            if center_inside and coverage >= 0.5 and rms <= 0.10:
+                p["approx"] = False
+                p["excluded"] = False
+            elif center_inside and coverage >= 0.25 and rms <= 0.30:
+                p["approx"] = True
+                p["excluded"] = False
+            else:
+                p["approx"] = False
+                p["excluded"] = True
             particles.append(p)
 
-        particles.sort(key=lambda p: p.get("excluded", False))
+        particles.sort(key=lambda p: (p.get("excluded", False), p.get("approx", False)))
         return self._dedup(particles, med)
 
     @staticmethod
@@ -589,6 +594,7 @@ class ParticleAnalyzer:
             "d50": float(np.percentile(diameters_sorted, 50)),
             "d90": float(np.percentile(diameters_sorted, 90)),
             "excluded": excluded_count,
+            "approx": sum(1 for p in particles if p.get("approx")),
         }
         if particles and "has_core" in particles[0]:
             core_count = sum(1 for p in particles if p["has_core"])
