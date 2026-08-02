@@ -122,7 +122,68 @@ class ParticleAnalyzer:
                                                     min_area_px, circularity_thresh)
                 particles.extend(separated)
 
+        use_hough = not hollow and len(particles) < 3
+        if not use_hough and not hollow and particles:
+            px_areas = [np.pi * p["radius_px"] ** 2 for p in particles]
+            median_area = np.median(px_areas)
+            img_area = analysis_region.shape[0] * analysis_region.shape[1]
+            if median_area < img_area * 0.005:
+                use_hough = True
+
+        if use_hough:
+            hough_particles = self._detect_hough(analysis_region, min_area_px)
+            if hough_particles:
+                hough_median = np.median([np.pi * p["radius_px"] ** 2 for p in hough_particles])
+                contour_median = np.median(px_areas) if particles else 0
+                if hough_median > contour_median * 2 or len(hough_particles) > len(particles):
+                    particles = hough_particles
+
         return particles
+
+    def _detect_hough(self, gray, min_area_px):
+        h, w = gray.shape
+        blurred = cv2.GaussianBlur(gray, (5, 5), 1.5)
+        min_r = max(10, int(np.sqrt(min_area_px / np.pi)))
+        max_r = min(h, w) // 3
+        min_dist = max(30, min_r * 3)
+
+        for param2 in [45, 40, 35, 30]:
+            circles = cv2.HoughCircles(
+                blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_dist,
+                param1=80, param2=param2, minRadius=min_r, maxRadius=max_r
+            )
+            if circles is not None and len(circles[0]) >= 3:
+                particles = []
+                for cx, cy, r in circles[0]:
+                    cx, cy, r = int(cx), int(cy), int(r)
+                    inside_x = max(0, min(cx + r, w) - max(cx - r, 0))
+                    inside_y = max(0, min(cy + r, h) - max(cy - r, 0))
+                    if inside_x < r or inside_y < r:
+                        continue
+                    area_px = np.pi * r * r
+                    p = self._measure_circle(cx, cy, r, area_px)
+                    particles.append(p)
+                return particles
+
+        return []
+
+    def _measure_circle(self, cx, cy, radius, area_px):
+        diameter_px = radius * 2
+        if self.nm_per_px:
+            diameter_nm = diameter_px * self.nm_per_px
+            area_nm2 = area_px * (self.nm_per_px ** 2)
+        else:
+            diameter_nm = diameter_px
+            area_nm2 = area_px
+        return {
+            "center_x": cx,
+            "center_y": cy,
+            "diameter_px": diameter_px,
+            "radius_px": radius,
+            "diameter": diameter_nm,
+            "area": area_nm2,
+            "contour": None,
+        }
 
     @staticmethod
     def _is_spherical(cnt, area):
@@ -138,6 +199,13 @@ class ParticleAnalyzer:
             line = gray[row, :]
             dark_ratio = np.sum(line < 30) / w
             if dark_ratio > 0.5:
+                return row
+        mean_brightness = np.mean(gray, axis=1)
+        for row in range(h - 1, int(h * 0.75), -1):
+            if mean_brightness[row] < mean_brightness[int(h * 0.5)] * 0.6:
+                for start_row in range(row, int(h * 0.75), -1):
+                    if mean_brightness[start_row] >= mean_brightness[int(h * 0.5)] * 0.8:
+                        return start_row
                 return row
         return int(h * 0.9)
 
@@ -167,23 +235,34 @@ class ParticleAnalyzer:
         return cv2.bitwise_or(binary, inv)
 
     def _preprocess(self, gray):
-        denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+        h, w = gray.shape
+        small_image = min(h, w) < 500
 
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        if small_image:
+            denoised = cv2.GaussianBlur(gray, (3, 3), 0)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        else:
+            denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
         enhanced = clahe.apply(denoised)
 
         _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-        adaptive = cv2.adaptiveThreshold(
-            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 31, 5
-        )
-
-        binary = cv2.bitwise_or(otsu, adaptive)
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        if small_image:
+            binary = otsu
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+        else:
+            adaptive = cv2.adaptiveThreshold(
+                enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV, 31, 5
+            )
+            binary = cv2.bitwise_or(otsu, adaptive)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
 
         return binary
 
