@@ -267,10 +267,22 @@ class ParticleAnalyzer:
             p = self._measure_circle(ux, uy, rr, np.pi * rr * rr)
             p["contour"] = pts.reshape(-1, 1, 2).astype(np.int32)
             center_inside = 4 <= ux <= w - 4 and 4 <= uy <= h - 4
-            if center_inside and coverage >= 0.5 and rms <= 0.10:
+
+            ring = np.linspace(0, 2 * np.pi, 96, endpoint=False)
+            rxs = ux + rr * np.cos(ring)
+            rys = uy + rr * np.sin(ring)
+            ring_inside = ((rxs >= 0) & (rxs < w) & (rys >= 0) & (rys < h)).mean()
+
+            good = (s_ang > score_thresh) & ~np.isnan(r_ang)
+            r_from_fit = np.hypot(cx + np.where(np.isnan(r_ang), 0, r_ang) * np.cos(angles) - ux,
+                                  cy + np.where(np.isnan(r_ang), 0, r_ang) * np.sin(angles) - uy)
+            spread = self._smoothed_spread(r_from_fit, good)
+
+            usable = center_inside and ring_inside >= 0.5 and spread <= 1.6
+            if usable and coverage >= 0.5 and rms <= 0.10:
                 p["approx"] = False
                 p["excluded"] = False
-            elif center_inside and coverage >= 0.25 and rms <= 0.30:
+            elif usable and coverage >= 0.25 and rms <= 0.30:
                 p["approx"] = True
                 p["excluded"] = False
             else:
@@ -279,7 +291,21 @@ class ParticleAnalyzer:
             particles.append(p)
 
         particles.sort(key=lambda p: (p.get("excluded", False), p.get("approx", False)))
-        return self._dedup(particles, med)
+        particles = self._dedup(particles, med)
+
+        for i, p in enumerate(particles):
+            if p.get("excluded"):
+                continue
+            for q in particles[i + 1:]:
+                if q.get("excluded"):
+                    continue
+                d = np.hypot(p["center_x"] - q["center_x"], p["center_y"] - q["center_y"])
+                if d < 0.8 * max(p["radius_px"], q["radius_px"]):
+                    p["excluded"] = True
+                    q["excluded"] = True
+                    p["approx"] = False
+                    q["approx"] = False
+        return particles
 
     @staticmethod
     def _trace_boundary(gx, gy, cx, cy, r0, w, h, n_angles=96):
@@ -300,6 +326,21 @@ class ParticleAnalyzer:
             s_best[i] = outward[j]
             r_best[i] = radii[valid][j]
         return angles, r_best, s_best
+
+    @staticmethod
+    def _smoothed_spread(r_ang, good, win=5):
+        n = len(r_ang)
+        idx = np.where(good)[0]
+        if len(idx) < 8:
+            return np.inf
+        half = win // 2
+        smoothed = []
+        for i in idx:
+            neighbors = [r_ang[(i + d) % n] for d in range(-half, half + 1)
+                         if good[(i + d) % n]]
+            smoothed.append(np.median(neighbors))
+        smoothed = np.array(smoothed)
+        return np.percentile(smoothed, 90) / max(np.percentile(smoothed, 10), 1)
 
     @staticmethod
     def _robust_circle_fit(cx, cy, angles, r_ang, s_ang, score_thresh):
