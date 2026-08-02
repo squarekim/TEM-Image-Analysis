@@ -309,7 +309,8 @@ class MainWindow(QMainWindow):
             r = int(p["radius_px"])
             cv2.circle(display, (cx, cy), r, (0, 255, 0), 2)
             if p.get("has_core"):
-                cv2.circle(display, (cx, cy), int(p["core_radius_px"]), (0, 165, 255), 2)
+                cv2.drawMarker(display, (cx, cy), (0, 165, 255),
+                               cv2.MARKER_CROSS, max(8, r // 2), 2)
             cv2.putText(display, str(i + 1), (cx - 10, cy - r - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         self._display_image(display)
@@ -337,10 +338,8 @@ class MainWindow(QMainWindow):
         self.lbl_d50.setText(f"{stats['d50']:.2f} {u}")
         self.lbl_d90.setText(f"{stats['d90']:.2f} {u}")
         if "core_ratio" in stats:
-            txt = f"{stats['core_count']}/{stats['count']} ({stats['core_ratio']*100:.1f}%)"
-            if "core_mean" in stats:
-                txt += f", 평균 {stats['core_mean']:.2f} {u}"
-            self.lbl_core.setText(txt)
+            self.lbl_core.setText(
+                f"{stats['core_count']}/{stats['count']} ({stats['core_ratio']*100:.1f}%)")
         else:
             self.lbl_core.setText("-")
 
@@ -359,8 +358,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 1, QTableWidgetItem(f"{p['diameter']:.2f} {u}"))
             self.table.setItem(i, 2, QTableWidgetItem(f"{p['area']:.2f} {u}²"))
             if has_core_col:
-                core_txt = f"{p['core_diameter']:.2f} {u}" if p["has_core"] else "없음"
-                self.table.setItem(i, 3, QTableWidgetItem(core_txt))
+                self.table.setItem(i, 3, QTableWidgetItem("유" if p["has_core"] else "무"))
 
     def _update_histogram(self):
         diameters = [p["diameter"] for p in self.particles]
@@ -385,13 +383,12 @@ class MainWindow(QMainWindow):
         has_core = bool(self.particles) and "has_core" in self.particles[0]
         headers = ["#", f"Diameter ({u})", f"Area ({u}²)", "Center X (px)", "Center Y (px)"]
         if has_core:
-            headers += ["Has Core", f"Core Diameter ({u})"]
+            headers += ["Has Core"]
         ws_data.append(headers)
         for i, p in enumerate(self.particles):
             row = [i + 1, p["diameter"], p["area"], p["center_x"], p["center_y"]]
             if has_core:
-                row += ["Y" if p["has_core"] else "N",
-                        p["core_diameter"] if p["has_core"] else None]
+                row += ["Y" if p["has_core"] else "N"]
             ws_data.append(row)
 
         ws_stats = wb.create_sheet("Statistics")
@@ -408,8 +405,6 @@ class MainWindow(QMainWindow):
         if "core_ratio" in stats:
             ws_stats.append(["Core Count", stats["core_count"], ""])
             ws_stats.append(["Core Ratio", stats["core_ratio"], ""])
-            if "core_mean" in stats:
-                ws_stats.append(["Core Mean Diameter", stats["core_mean"], u])
 
         if self.nm_per_px:
             ws_stats.append([])

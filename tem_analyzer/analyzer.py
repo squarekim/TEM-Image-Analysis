@@ -154,13 +154,8 @@ class ParticleAnalyzer:
 
         if detect_cores:
             for p in particles:
-                has_core, core_r = self._detect_core(
+                p["has_core"] = self._detect_core(
                     gray, p["center_x"], p["center_y"], int(p["radius_px"]))
-                p["has_core"] = has_core
-                p["core_radius_px"] = core_r
-                core_d_px = core_r * 2
-                p["core_diameter"] = (core_d_px * self.nm_per_px
-                                      if self.nm_per_px else core_d_px)
 
         return particles
 
@@ -171,13 +166,13 @@ class ParticleAnalyzer:
         x0, x1 = max(0, cx - ri), min(w, cx + ri)
         y0, y1 = max(0, cy - ri), min(h, cy + ri)
         if x1 - x0 < 6 or y1 - y0 < 6:
-            return False, 0.0
+            return False
         roi = gray[y0:y1, x0:x1]
         yy, xx = np.mgrid[y0:y1, x0:x1]
         mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= ri * ri
         vals = roi[mask]
         if len(vals) < 30:
-            return False, 0.0
+            return False
 
         ring_vals = []
         a = np.linspace(0, 2 * np.pi, 48, endpoint=False)
@@ -189,26 +184,24 @@ class ParticleAnalyzer:
         rim = np.percentile(ring_vals, 25)
 
         p10, p75 = np.percentile(vals, [10, 75])
-        if p75 - rim < 20:
-            return False, 0.0
-        if p75 - p10 < 25:
-            return False, 0.0
+        if p75 - rim < 15:
+            return False
+        if p75 - p10 < 20:
+            return False
 
         t = (p10 + p75) / 2
         dark = ((roi < t) & mask).astype(np.uint8) * 255
         dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return False, 0.0
+            return False
         cnt = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(cnt)
-        interior_area = np.pi * ri * ri
-        if area < interior_area * 0.04 or area > interior_area * 0.85:
-            return False, 0.0
-        (ccx, ccy), core_r = cv2.minEnclosingCircle(cnt)
-        if np.hypot(ccx + x0 - cx, ccy + y0 - cy) > r * 0.55:
-            return False, 0.0
-        return True, core_r
+        if cv2.contourArea(cnt) < np.pi * ri * ri * 0.03:
+            return False
+        (ccx, ccy), _ = cv2.minEnclosingCircle(cnt)
+        if np.hypot(ccx + x0 - cx, ccy + y0 - cy) > r * 0.7:
+            return False
+        return True
 
     def _detect_hough(self, gray, min_area_px):
         h, w = gray.shape
@@ -270,7 +263,59 @@ class ParticleAnalyzer:
                 continue
             area_px = np.pi * r * r
             particles.append(self._measure_circle(cx, cy, r, area_px))
+
+        particles = self._split_oversized(particles, blurred, edge_pts, bg_mask, w, h, rng)
         return particles
+
+    def _split_oversized(self, particles, blurred, edge_pts, bg_mask, w, h, rng):
+        if len(particles) < 5:
+            return particles
+        radii = np.array([p["radius_px"] for p in particles])
+        med = np.median(radii)
+        result = []
+        for p in particles:
+            cx, cy, r = p["center_x"], p["center_y"], int(p["radius_px"])
+            if r <= med * 1.35:
+                result.append(p)
+                continue
+            subs = self._rehough_region(blurred, cx, cy, r, med, w, h)
+            if not subs or len(subs) < 2:
+                result.append(p)
+                continue
+            for scx, scy, sr in subs:
+                refined = self._ransac_refine(edge_pts, bg_mask, scx, scy, sr, w, h, rng)
+                if refined is not None:
+                    scx, scy, sr = refined
+                result.append(self._measure_circle(scx, scy, sr, np.pi * sr * sr))
+        return result
+
+    @staticmethod
+    def _rehough_region(blurred, cx, cy, r, med, w, h):
+        pad = int(r * 1.2)
+        x0, x1 = max(0, cx - pad), min(w, cx + pad)
+        y0, y1 = max(0, cy - pad), min(h, cy + pad)
+        roi = blurred[y0:y1, x0:x1]
+        if roi.shape[0] < 10 or roi.shape[1] < 10:
+            return None
+        min_r = max(3, int(med * 0.7))
+        max_r = int(med * 1.25)
+        for param2 in [30, 25, 20]:
+            circles = cv2.HoughCircles(
+                roi, cv2.HOUGH_GRADIENT, dp=1.2,
+                minDist=max(8, int(med * 1.2)),
+                param1=80, param2=param2,
+                minRadius=min_r, maxRadius=max_r
+            )
+            if circles is None:
+                continue
+            subs = []
+            for scx, scy, sr in circles[0]:
+                gcx, gcy = int(scx) + x0, int(scy) + y0
+                if np.hypot(gcx - cx, gcy - cy) <= r:
+                    subs.append((gcx, gcy, int(sr)))
+            if len(subs) >= 2:
+                return subs
+        return None
 
     @staticmethod
     def _background_mask(blur, circles):
@@ -603,7 +648,4 @@ class ParticleAnalyzer:
             core_count = sum(1 for p in particles if p["has_core"])
             stats["core_count"] = core_count
             stats["core_ratio"] = core_count / len(particles)
-            core_diams = [p["core_diameter"] for p in particles if p["has_core"]]
-            if core_diams:
-                stats["core_mean"] = float(np.mean(core_diams))
         return stats
