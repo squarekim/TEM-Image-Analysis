@@ -122,21 +122,21 @@ class ParticleAnalyzer:
                                                     min_area_px, circularity_thresh)
                 particles.extend(separated)
 
-        use_hough = not hollow and len(particles) < 3
-        if not use_hough and not hollow and particles:
-            px_areas = [np.pi * p["radius_px"] ** 2 for p in particles]
-            median_area = np.median(px_areas)
-            img_area = analysis_region.shape[0] * analysis_region.shape[1]
-            if median_area < img_area * 0.005:
-                use_hough = True
-
-        if use_hough:
+        if not hollow:
             hough_particles = self._detect_hough(analysis_region, min_area_px)
-            if hough_particles:
-                hough_median = np.median([np.pi * p["radius_px"] ** 2 for p in hough_particles])
-                contour_median = np.median(px_areas) if particles else 0
-                if hough_median > contour_median * 2 or len(hough_particles) > len(particles):
+            if hough_particles and particles:
+                px_areas = [np.pi * p["radius_px"] ** 2 for p in particles]
+                hough_areas = [np.pi * p["radius_px"] ** 2 for p in hough_particles]
+                contour_median = np.median(px_areas)
+                hough_median = np.median(hough_areas)
+                if hough_median > contour_median * 3:
                     particles = hough_particles
+                elif len(hough_particles) > len(particles) * 1.5:
+                    particles = hough_particles
+                elif len(particles) < 3:
+                    particles = hough_particles
+            elif hough_particles and not particles:
+                particles = hough_particles
 
         return particles
 
@@ -145,33 +145,52 @@ class ParticleAnalyzer:
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.5)
         min_r = max(5, int(np.sqrt(min_area_px / np.pi)))
         max_r = min(h, w) // 4
-        min_dist = max(15, min_r * 2)
 
+        est = None
         for param2 in [45, 40, 35, 30]:
             circles = cv2.HoughCircles(
-                blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_dist,
+                blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=max(10, min_r),
                 param1=80, param2=param2, minRadius=min_r, maxRadius=max_r
             )
-            if circles is None or len(circles[0]) < 3:
+            if circles is not None and len(circles[0]) >= 5:
+                est = self._radius_mode(circles[0][:, 2])
+                break
+        if est is None:
+            return []
+
+        min_r2 = max(min_r, int(est * 0.6))
+        max_r2 = int(est * 1.5)
+        min_dist2 = max(10, int(est * 1.4))
+
+        best = None
+        for param2 in [40, 35, 30, 25]:
+            circles = cv2.HoughCircles(
+                blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_dist2,
+                param1=80, param2=param2, minRadius=min_r2, maxRadius=max_r2
+            )
+            if circles is None:
                 continue
+            if best is None or len(circles[0]) > len(best):
+                best = circles[0]
+        if best is None:
+            return []
 
-            radii = circles[0][:, 2]
-            median_r = np.median(radii)
-            particles = []
-            for cx, cy, r in circles[0]:
-                cx, cy, r = int(cx), int(cy), int(r)
-                if r > median_r * 1.8:
-                    continue
-                inside_x = max(0, min(cx + r, w) - max(cx - r, 0))
-                inside_y = max(0, min(cy + r, h) - max(cy - r, 0))
-                if inside_x < r or inside_y < r:
-                    continue
-                area_px = np.pi * r * r
-                p = self._measure_circle(cx, cy, r, area_px)
-                particles.append(p)
-            return particles
+        particles = []
+        for cx, cy, r in best:
+            cx, cy, r = int(cx), int(cy), int(r)
+            inside_x = max(0, min(cx + r, w) - max(cx - r, 0))
+            inside_y = max(0, min(cy + r, h) - max(cy - r, 0))
+            if inside_x < r or inside_y < r:
+                continue
+            area_px = np.pi * r * r
+            particles.append(self._measure_circle(cx, cy, r, area_px))
+        return particles
 
-        return []
+    @staticmethod
+    def _radius_mode(radii):
+        hist, edges = np.histogram(radii, bins=max(5, int(len(radii) ** 0.5)))
+        idx = np.argmax(hist)
+        return (edges[idx] + edges[idx + 1]) / 2
 
     def _measure_circle(self, cx, cy, radius, area_px):
         diameter_px = radius * 2
