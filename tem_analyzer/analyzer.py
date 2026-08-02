@@ -193,10 +193,20 @@ class ParticleAnalyzer:
         gy = cv2.Sobel(blur3, cv2.CV_32F, 0, 1, ksize=3)
         grad_mag = np.sqrt(gx ** 2 + gy ** 2)
 
+        edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 1.2), 40, 120)
+        eys, exs = np.nonzero(edges)
+        edge_pts = np.column_stack([exs, eys])
+        bg_mask = self._background_mask(blur3, best)
+        rng = np.random.default_rng(0)
+
         particles = []
         for cx, cy, r in best:
             cx, cy, r = int(cx), int(cy), int(r)
-            cx, cy, r = self._refine_circle(grad_mag, cx, cy, r, w, h)
+            refined = self._ransac_refine(edge_pts, bg_mask, cx, cy, r, w, h, rng)
+            if refined is not None:
+                cx, cy, r = refined
+            else:
+                cx, cy, r = self._refine_circle(grad_mag, cx, cy, r, w, h)
             inside_x = max(0, min(cx + r, w) - max(cx - r, 0))
             inside_y = max(0, min(cy + r, h) - max(cy - r, 0))
             if inside_x < r or inside_y < r:
@@ -204,6 +214,91 @@ class ParticleAnalyzer:
             area_px = np.pi * r * r
             particles.append(self._measure_circle(cx, cy, r, area_px))
         return particles
+
+    @staticmethod
+    def _background_mask(blur, circles):
+        h, w = blur.shape
+        interior = []
+        for cx, cy, r in circles:
+            ri = max(1, int(r * 0.5))
+            a = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+            xs = (cx + ri * np.cos(a)).astype(int)
+            ys = (cy + ri * np.sin(a)).astype(int)
+            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            interior.extend(blur[ys[v], xs[v]])
+        particle_level = np.median(interior) if interior else 0
+        bg_level = np.percentile(blur, 95)
+        if bg_level - particle_level < 15:
+            return np.zeros_like(blur, dtype=np.float32)
+        return (blur > (particle_level + bg_level) / 2).astype(np.float32)
+
+    @staticmethod
+    def _bg_fraction(bg_mask, cx, cy, r, w, h):
+        total, count = 0.0, 0
+        for f in (0.3, 0.5, 0.7, 0.85):
+            ri = max(1, int(r * f))
+            n = max(8, int(2 * np.pi * ri / 3))
+            a = np.linspace(0, 2 * np.pi, n, endpoint=False)
+            xs = (cx + ri * np.cos(a)).astype(int)
+            ys = (cy + ri * np.sin(a)).astype(int)
+            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            total += bg_mask[ys[v], xs[v]].sum()
+            count += v.sum()
+        return total / max(count, 1)
+
+    @staticmethod
+    def _circle_from_3pts(p1, p2, p3):
+        ax, ay = p1
+        bx, by = p2
+        cx, cy = p3
+        d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+        if abs(d) < 1e-6:
+            return None
+        ux = ((ax * ax + ay * ay) * (by - cy) + (bx * bx + by * by) * (cy - ay)
+              + (cx * cx + cy * cy) * (ay - by)) / d
+        uy = ((ax * ax + ay * ay) * (cx - bx) + (bx * bx + by * by) * (ax - cx)
+              + (cx * cx + cy * cy) * (bx - ax)) / d
+        return ux, uy, np.hypot(ax - ux, ay - uy)
+
+    def _ransac_refine(self, edge_pts, bg_mask, cx, cy, r0, w, h, rng,
+                       n_iter=400, tol=2.0):
+        if len(edge_pts) == 0:
+            return None
+        d = np.hypot(edge_pts[:, 0] - cx, edge_pts[:, 1] - cy)
+        sel = edge_pts[(d > r0 * 0.6) & (d < r0 * 1.45)]
+        if len(sel) < 10:
+            return None
+        best = None
+        best_score = -1.0
+        n = len(sel)
+        for _ in range(n_iter):
+            idx = rng.choice(n, 3, replace=False)
+            c = self._circle_from_3pts(sel[idx[0]], sel[idx[1]], sel[idx[2]])
+            if c is None:
+                continue
+            ux, uy, r = c
+            if not (r0 * 0.7 <= r <= r0 * 1.4):
+                continue
+            if np.hypot(ux - cx, uy - cy) > r0 * 0.45:
+                continue
+            dd = np.abs(np.hypot(sel[:, 0] - ux, sel[:, 1] - uy) - r)
+            inliers = np.sum(dd < tol)
+            score = inliers * (1.0 - self._bg_fraction(bg_mask, int(ux), int(uy), int(r), w, h)) ** 2
+            if score > best_score:
+                best_score = score
+                best = (ux, uy, r)
+        if best is None:
+            return None
+        ux, uy, r = best
+        dd = np.abs(np.hypot(sel[:, 0] - ux, sel[:, 1] - uy) - r)
+        pts = sel[dd < tol].astype(np.float64)
+        if len(pts) >= 6:
+            A = np.column_stack([2 * pts[:, 0], 2 * pts[:, 1], np.ones(len(pts))])
+            b = pts[:, 0] ** 2 + pts[:, 1] ** 2
+            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+            ux, uy = sol[0], sol[1]
+            r = np.sqrt(sol[2] + ux * ux + uy * uy)
+        return int(round(ux)), int(round(uy)), int(round(r))
 
     @staticmethod
     def _refine_circle(grad_mag, cx, cy, r, w, h, search=0.35, n_angles=72):
