@@ -89,6 +89,7 @@ class ParticleAnalyzer:
         h, w = gray.shape
         cutoff = self._find_scalebar_top(gray)
         analysis_region = gray[:cutoff, :]
+        scalebar_rect = self._find_scalebar_rect(gray) if cutoff >= h else None
 
         binary = self._preprocess(analysis_region)
         if hollow:
@@ -137,6 +138,18 @@ class ParticleAnalyzer:
                     particles = hough_particles
             elif hough_particles and not particles:
                 particles = hough_particles
+
+        if scalebar_rect:
+            sx, sy, sw, sh = scalebar_rect
+            margin = 8
+            kept = []
+            for p in particles:
+                cx, cy, r = p["center_x"], p["center_y"], p["radius_px"]
+                if (sy - margin - r < cy < sy + sh + margin + r
+                        and sx - margin - r < cx < sx + sw + margin + r):
+                    continue
+                kept.append(p)
+            particles = kept
 
         return particles
 
@@ -252,14 +265,20 @@ class ParticleAnalyzer:
             dark_ratio = np.sum(line < 30) / w
             if dark_ratio > 0.5:
                 return row
-        mean_brightness = np.mean(gray, axis=1)
-        for row in range(h - 1, int(h * 0.75), -1):
-            if mean_brightness[row] < mean_brightness[int(h * 0.5)] * 0.6:
-                for start_row in range(row, int(h * 0.75), -1):
-                    if mean_brightness[start_row] >= mean_brightness[int(h * 0.5)] * 0.8:
-                        return start_row
-                return row
-        return int(h * 0.9)
+        return h
+
+    @staticmethod
+    def _find_scalebar_rect(gray):
+        h, w = gray.shape
+        y0 = int(h * 0.8)
+        bottom = gray[y0:, :]
+        _, dark = cv2.threshold(bottom, 60, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            if cw > w * 0.1 and ch < 20 and cw / max(ch, 1) > 4:
+                return (x, y0 + y, cw, ch)
+        return None
 
     @staticmethod
     def _enhance_hollow(binary, gray):
