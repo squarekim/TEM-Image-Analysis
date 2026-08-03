@@ -6,10 +6,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
     QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox, QSplitter,
-    QMessageBox, QStatusBar, QHeaderView, QComboBox, QCheckBox,
+    QMessageBox, QHeaderView, QComboBox, QCheckBox,
 )
-from PyQt5.QtCore import Qt, QSize
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QImage, QPixmap
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import openpyxl
@@ -307,16 +307,26 @@ class MainWindow(QMainWindow):
         if max_area == 0:
             max_area = None
 
-        analyzer = ParticleAnalyzer(nm_per_px=self.nm_per_px)
-        self.particles = analyzer.analyze(
-            self.original_image,
-            min_area_px=self.spin_min_area.value(),
-            max_area_px=max_area,
-            circularity_thresh=self.spin_circularity.value(),
-            use_watershed=self.chk_watershed.isChecked(),
-            hollow=self.chk_hollow.isChecked(),
-            detect_cores=self.chk_core.isChecked(),
-        )
+        # Analysis runs on the UI thread and takes seconds on full-resolution
+        # TEM images, so make the wait visible instead of looking frozen.
+        self.statusBar().showMessage("분석 중...")
+        self.btn_analyze.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            analyzer = ParticleAnalyzer(nm_per_px=self.nm_per_px)
+            self.particles = analyzer.analyze(
+                self.original_image,
+                min_area_px=self.spin_min_area.value(),
+                max_area_px=max_area,
+                circularity_thresh=self.spin_circularity.value(),
+                use_watershed=self.chk_watershed.isChecked(),
+                hollow=self.chk_hollow.isChecked(),
+                detect_cores=self.chk_core.isChecked(),
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.btn_analyze.setEnabled(True)
 
         self._draw_results()
         stats = ParticleAnalyzer.compute_statistics(self.particles)

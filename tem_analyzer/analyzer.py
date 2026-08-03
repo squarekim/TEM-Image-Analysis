@@ -347,19 +347,20 @@ class ParticleAnalyzer:
         angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
         radii = np.arange(max(2, r0 * 0.55), r0 * 1.5, 0.5)
         cos_a, sin_a = np.cos(angles), np.sin(angles)
-        r_best = np.full(n_angles, np.nan)
-        s_best = np.zeros(n_angles)
-        for i in range(n_angles):
-            xs = (cx + radii * cos_a[i]).astype(int)
-            ys = (cy + radii * sin_a[i]).astype(int)
-            valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-            if valid.sum() < len(radii) * 0.5:
-                continue
-            outward = (gx[ys[valid], xs[valid]] * cos_a[i]
-                       + gy[ys[valid], xs[valid]] * sin_a[i])
-            j = np.argmax(outward)
-            s_best[i] = outward[j]
-            r_best[i] = radii[valid][j]
+
+        xs = (cx + np.outer(cos_a, radii)).astype(int)
+        ys = (cy + np.outer(sin_a, radii)).astype(int)
+        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+
+        rows = np.clip(ys, 0, h - 1)
+        cols = np.clip(xs, 0, w - 1)
+        outward = (gx[rows, cols] * cos_a[:, None] + gy[rows, cols] * sin_a[:, None])
+        outward = np.where(valid, outward, -np.inf)
+
+        best = np.argmax(outward, axis=1)
+        enough = valid.sum(axis=1) >= len(radii) * 0.5
+        r_best = np.where(enough, radii[best], np.nan)
+        s_best = np.where(enough, outward[np.arange(n_angles), best], 0.0)
         return angles, r_best, s_best
 
     @staticmethod
@@ -369,12 +370,9 @@ class ParticleAnalyzer:
         if len(idx) < 8:
             return np.inf
         half = win // 2
-        smoothed = []
-        for i in idx:
-            neighbors = [r_ang[(i + d) % n] for d in range(-half, half + 1)
-                         if good[(i + d) % n]]
-            smoothed.append(np.median(neighbors))
-        smoothed = np.array(smoothed)
+        neighbors = (idx[:, None] + np.arange(-half, half + 1)[None, :]) % n
+        window = np.where(good[neighbors], r_ang[neighbors], np.nan)
+        smoothed = np.nanmedian(window, axis=1)
         return np.percentile(smoothed, 90) / max(np.percentile(smoothed, 10), 1)
 
     @staticmethod
@@ -453,22 +451,16 @@ class ParticleAnalyzer:
         idx = np.argmax(hist)
         return (edges[idx] + edges[idx + 1]) / 2
 
-    def _measure_circle(self, cx, cy, radius, area_px):
-        diameter_px = radius * 2
-        if self.nm_per_px:
-            diameter_nm = diameter_px * self.nm_per_px
-            area_nm2 = area_px * (self.nm_per_px ** 2)
-        else:
-            diameter_nm = diameter_px
-            area_nm2 = area_px
+    def _measure_circle(self, cx, cy, radius, area_px, contour=None):
+        """Build a particle record, converting to nm when a scale is known."""
+        scale = self.nm_per_px or 1.0
         return {
-            "center_x": cx,
-            "center_y": cy,
-            "diameter_px": diameter_px,
+            "center_x": int(cx),
+            "center_y": int(cy),
             "radius_px": radius,
-            "diameter": diameter_nm,
-            "area": area_nm2,
-            "contour": None,
+            "diameter": radius * 2 * scale,
+            "area": area_px * scale ** 2,
+            "contour": contour,
         }
 
     @staticmethod
@@ -569,6 +561,21 @@ class ParticleAnalyzer:
         return mask
 
     def _split_overlapping(self, cnt, binary, gray, min_area_px, circularity_thresh):
+        # Work inside the contour's bounding box: a full-frame mask and distance
+        # transform per contour is what made large images unusably slow. The pad
+        # covers the widest dilation used below so results match the full-frame
+        # computation.
+        pad = 8
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        x0 = max(0, bx - pad)
+        y0 = max(0, by - pad)
+        x1 = min(binary.shape[1], bx + bw + pad)
+        y1 = min(binary.shape[0], by + bh + pad)
+        offset = np.array([[x0, y0]], dtype=cnt.dtype)
+        cnt = cnt - offset
+        binary = binary[y0:y1, x0:x1]
+        gray = gray[y0:y1, x0:x1]
+
         mask = np.zeros_like(binary)
         cv2.drawContours(mask, [cnt], -1, 255, -1)
 
@@ -625,7 +632,7 @@ class ParticleAnalyzer:
             circ = 4 * np.pi * seg_area / (seg_perim * seg_perim)
             if circ < circularity_thresh * 0.7:
                 continue
-            p = self._measure_single(seg_cnt, seg_area)
+            p = self._measure_single(seg_cnt + offset, seg_area)
             if p:
                 results.append(p)
 
@@ -633,24 +640,7 @@ class ParticleAnalyzer:
 
     def _measure_single(self, cnt, area_px):
         (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-        diameter_px = radius * 2
-
-        if self.nm_per_px:
-            diameter_nm = diameter_px * self.nm_per_px
-            area_nm2 = area_px * (self.nm_per_px ** 2)
-        else:
-            diameter_nm = diameter_px
-            area_nm2 = area_px
-
-        return {
-            "center_x": int(cx),
-            "center_y": int(cy),
-            "diameter_px": diameter_px,
-            "radius_px": radius,
-            "diameter": diameter_nm,
-            "area": area_nm2,
-            "contour": cnt,
-        }
+        return self._measure_circle(cx, cy, radius, area_px, contour=cnt)
 
     @staticmethod
     def compute_statistics(particles):
