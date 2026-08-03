@@ -9,6 +9,41 @@ except ImportError:
     HAS_TESSERACT = False
 
 
+def load_image(path):
+    """Load a TEM image as 8-bit BGR.
+
+    TEM cameras commonly write 16-bit or float TIFFs whose values occupy only
+    part of the container's range (e.g. 12-bit data in a 16-bit file). Reading
+    those with a plain cv2.imread crushes the contrast, so high-bit-depth data
+    is rescaled from its actual intensity range instead.
+    """
+    data = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if data is None:
+        return None
+
+    if data.ndim == 3 and data.shape[2] == 4:
+        data = data[:, :, :3]
+    elif data.ndim == 3 and data.shape[2] == 2:
+        data = data[:, :, 0]
+
+    if data.dtype != np.uint8:
+        values = data[np.isfinite(data)] if data.dtype.kind == "f" else data
+        if values.size == 0:
+            return None
+        lo, hi = np.percentile(values, [0.1, 99.9])
+        if hi <= lo:
+            lo, hi = float(np.min(values)), float(np.max(values))
+        if hi <= lo:
+            data = np.zeros(data.shape, np.uint8)
+        else:
+            scaled = (data.astype(np.float32) - lo) * (255.0 / (hi - lo))
+            data = np.clip(np.nan_to_num(scaled), 0, 255).astype(np.uint8)
+
+    if data.ndim == 2:
+        data = cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
+    return data
+
+
 class ScaleBarDetector:
     def detect(self, image):
         h, w = image.shape[:2]

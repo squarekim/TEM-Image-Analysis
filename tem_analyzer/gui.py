@@ -14,7 +14,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import openpyxl
 
-from .analyzer import ScaleBarDetector, ParticleAnalyzer, HAS_TESSERACT
+from .analyzer import ScaleBarDetector, ParticleAnalyzer, HAS_TESSERACT, load_image
 
 
 class ImageLabel(QLabel):
@@ -267,7 +267,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        self.image = cv2.imread(path)
+        self.image = load_image(path)
         if self.image is None:
             QMessageBox.warning(self, "오류", "이미지를 읽을 수 없습니다.")
             return
