@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import os
 import re
 
 try:
@@ -16,8 +17,20 @@ def load_image(path):
     part of the container's range (e.g. 12-bit data in a 16-bit file). Reading
     those with a plain cv2.imread crushes the contrast, so high-bit-depth data
     is rescaled from its actual intensity range instead.
+
+    The file is read through numpy rather than cv2.imread because on Windows
+    cv2.imread opens paths using the ANSI codepage and simply returns None for
+    any path containing non-ASCII characters - a Korean user name in
+    C:\\Users\\... is enough to make every image look unreadable.
     """
-    data = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    try:
+        raw = np.fromfile(path, dtype=np.uint8)
+    except (OSError, ValueError):
+        return None
+    if raw.size == 0:
+        return None
+
+    data = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
     if data is None:
         return None
 
@@ -42,6 +55,23 @@ def load_image(path):
     if data.ndim == 2:
         data = cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
     return data
+
+
+def save_image(path, image):
+    """Write an image, tolerating non-ASCII paths on Windows.
+
+    cv2.imwrite has the same ANSI-codepage limitation as cv2.imread, so the
+    encode and the write are done separately.
+    """
+    ext = os.path.splitext(path)[1] or ".png"
+    ok, buf = cv2.imencode(ext, image)
+    if not ok:
+        return False
+    try:
+        buf.tofile(path)
+    except OSError:
+        return False
+    return True
 
 
 class ScaleBarDetector:

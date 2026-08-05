@@ -19,7 +19,9 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import openpyxl
 
-from .analyzer import ScaleBarDetector, ParticleAnalyzer, HAS_TESSERACT, load_image
+from .analyzer import (
+    ScaleBarDetector, ParticleAnalyzer, HAS_TESSERACT, load_image, save_image,
+)
 
 
 class ImageLabel(QLabel):
@@ -460,7 +462,9 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        cv2.imwrite(path, self.result_image)
+        if not save_image(path, self.result_image):
+            QMessageBox.warning(self, "오류", "이미지를 저장할 수 없습니다.")
+            return
         self.statusBar().showMessage(f"결과 이미지 저장 완료: {path}")
 
     def _display_image(self, cv_img):
@@ -567,10 +571,13 @@ class MainWindow(QMainWindow):
             try:
                 import tempfile
                 from openpyxl.drawing.image import Image as XLImage
+                # Close the handle before writing: Windows will not let the
+                # image be written while the temp file is still open.
                 tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                cv2.imwrite(tmp.name, self.result_image)
-                ws_img = wb.create_sheet("Result Image")
-                ws_img.add_image(XLImage(tmp.name), "A1")
+                tmp.close()
+                if save_image(tmp.name, self.result_image):
+                    ws_img = wb.create_sheet("Result Image")
+                    ws_img.add_image(XLImage(tmp.name), "A1")
             except Exception:
                 pass
 
