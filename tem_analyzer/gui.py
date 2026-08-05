@@ -161,9 +161,6 @@ class MainWindow(QMainWindow):
         scale_form.addRow("상태:", self.scale_status)
 
         self.chk_manual = QCheckBox("수동 입력 사용")
-        self.chk_manual.toggled.connect(self._toggle_manual_scale)
-        if not HAS_TESSERACT:
-            self.chk_manual.setChecked(True)
         scale_form.addRow(self.chk_manual)
 
         self.spin_bar_px = QDoubleSpinBox()
@@ -182,6 +179,13 @@ class MainWindow(QMainWindow):
         self.combo_unit.addItems(["nm", "μm", "mm"])
         self.combo_unit.setEnabled(False)
         scale_form.addRow("단위:", self.combo_unit)
+
+        # Connect only once the widgets the handler touches exist: checking the
+        # box emits toggled immediately, and without OCR that fired before the
+        # spin boxes were built.
+        self.chk_manual.toggled.connect(self._toggle_manual_scale)
+        if not HAS_TESSERACT:
+            self.chk_manual.setChecked(True)
 
         scale_group.setLayout(scale_form)
         right_layout.addWidget(scale_group)
