@@ -55,7 +55,9 @@ py -m pip install --user -r requirements.txt   # 처음 한 번만
 py run.py
 ```
 
-`py`가 없으면 `python` 또는 `python3`으로 바꿔 쓰세요. `--user`는 관리자 권한 없이
+`py`가 없으면 `python` 또는 `python3`으로 바꿔 쓰세요. `py`를 쳤을 때 사용법 도움말만
+나온다면 Python Install Manager만 깔리고 파이썬 본체가 없는 상태이므로,
+`py install 3.13`으로 런타임을 먼저 받으세요. `--user`는 관리자 권한 없이
 설치하기 위한 옵션입니다. `py run.py` 대신 `py -m tem_analyzer`로도 실행됩니다.
 
 폴더에서 명령창을 여는 방법: 파일 탐색기 **주소창**을 클릭해 경로가 선택되면 `cmd`를 입력하고 Enter.

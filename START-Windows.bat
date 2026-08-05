@@ -22,7 +22,14 @@ set "PY="
 py -3 -c "print(1)" >nul 2>&1 && set "PY=py -3"
 if not defined PY python -c "print(1)" >nul 2>&1 && set "PY=python"
 if not defined PY python3 -c "print(1)" >nul 2>&1 && set "PY=python3"
-if not defined PY goto NOPYTHON
+if defined PY goto HAVEPYTHON
+
+rem The Python Install Manager provides "py" but ships no runtime until
+rem "py install" is run, so "py" exists yet cannot execute any code.
+where py >nul 2>&1 && goto NORUNTIME
+goto NOPYTHON
+
+:HAVEPYTHON
 
 echo Python found:
 %PY% --version
@@ -45,6 +52,20 @@ echo [ERROR] run.py not found in this folder.
 echo.
 echo This file must sit in the same folder as run.py and requirements.txt.
 echo If you unzipped the download, open the inner folder and run it there.
+echo.
+pause
+exit /b 1
+
+:NORUNTIME
+echo [ERROR] Python Install Manager is present, but no Python runtime
+echo         is installed yet.
+echo.
+echo Run this command, wait for the download to finish, then start
+echo this file again:
+echo.
+echo     py install 3.13
+echo.
+echo You can check it worked with:  py list
 echo.
 pause
 exit /b 1
