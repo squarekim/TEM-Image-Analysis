@@ -189,25 +189,17 @@ class ParticleAnalyzer:
                                                     min_area_px, circularity_thresh)
                 particles.extend(separated)
 
-        # The seed-and-trace path runs in every mode: `hollow` only changes how
-        # the binary for the contour path above is built, and on real hollow
-        # images that binary often yields nothing, so gating this on `hollow`
-        # left exactly those images with no particles at all.
+        # Neither detector dominates, so both run and their results are merged.
+        # Seed-and-trace validates every circle against the actual edge and so
+        # separates touching particles the contour path fuses into one blob, but
+        # its radius band is set from the modal particle size and it misses
+        # anything far off that size. The contour path has the opposite profile:
+        # it handles a wide size range but merges neighbours that touch.
+        for p in particles:
+            p.setdefault("excluded", False)
+            p.setdefault("approx", False)
         hough_particles = self._detect_hough(analysis_region, min_area_px)
-        hough_valid = [p for p in hough_particles if not p.get("excluded")]
-        if hough_valid and particles:
-            px_areas = [np.pi * p["radius_px"] ** 2 for p in particles]
-            hough_areas = [np.pi * p["radius_px"] ** 2 for p in hough_valid]
-            contour_median = np.median(px_areas)
-            hough_median = np.median(hough_areas)
-            if hough_median > contour_median * 3:
-                particles = hough_particles
-            elif len(hough_valid) > len(particles) * 1.5:
-                particles = hough_particles
-            elif len(particles) < 3:
-                particles = hough_particles
-        elif hough_valid and not particles:
-            particles = hough_particles
+        particles = self._merge_detections(hough_particles, particles)
 
         if scalebar_rect:
             sx, sy, sw, sh = scalebar_rect
@@ -327,7 +319,8 @@ class ParticleAnalyzer:
 
         particles = []
         for (cx, cy, r), (angles, r_ang, s_ang) in zip(expanded, traces):
-            fit = self._robust_circle_fit(cx, cy, angles, r_ang, s_ang, score_thresh)
+            fit = self._robust_circle_fit(cx, cy, angles, r_ang, s_ang,
+                                          score_thresh, r0=r)
             if fit is None:
                 continue
             ux, uy, rr, coverage, rms, pts = fit
@@ -409,7 +402,7 @@ class ParticleAnalyzer:
         return np.percentile(smoothed, 90) / max(np.percentile(smoothed, 10), 1)
 
     @staticmethod
-    def _robust_circle_fit(cx, cy, angles, r_ang, s_ang, score_thresh):
+    def _robust_circle_fit(cx, cy, angles, r_ang, s_ang, score_thresh, r0=None):
         good = (s_ang > score_thresh) & ~np.isnan(r_ang)
         coverage = good.mean()
         if good.sum() < 8:
@@ -432,9 +425,64 @@ class ParticleAnalyzer:
             pts = pts[keep]
             if len(pts) < 8:
                 break
+
+        # Where particles touch, the contact side has no background to give an
+        # outward gradient, so the trace covers only a shallow arc - and a
+        # circle through a shallow arc can be arbitrarily large. The Hough seed
+        # radius is reliable, so a fit that runs away from it is replaced by the
+        # seed geometry with a radius taken from the traced edge directly.
+        if r0 is not None and not (0.65 * r0 <= r <= 1.45 * r0):
+            ux, uy = cx, cy
+            r = float(np.median(r_ang[good]))
+            pts = np.column_stack([cx + r_ang[good] * np.cos(angles[good]),
+                                   cy + r_ang[good] * np.sin(angles[good])])
+
         resid = np.abs(np.hypot(pts[:, 0] - ux, pts[:, 1] - uy) - r)
         rms = np.sqrt(np.mean(resid ** 2)) / max(r, 1)
         return ux, uy, r, coverage, rms, pts
+
+    @staticmethod
+    def _merge_detections(primary, secondary):
+        """Combine two detector outputs, keeping ``primary`` where they clash.
+
+        A particle from ``secondary`` is only added where nothing already
+        occupies that spot, so a contour blob spanning a touching pair is
+        dropped in favour of the two traced circles inside it.
+        """
+        merged = [p for p in primary if not p.get("excluded")]
+        rejected = [p for p in primary if p.get("excluded")]
+
+        for cand in secondary:
+            if cand.get("excluded"):
+                continue
+            clash = False
+            for kept in merged:
+                d = np.hypot(cand["center_x"] - kept["center_x"],
+                             cand["center_y"] - kept["center_y"])
+                if d < 0.8 * max(cand["radius_px"], kept["radius_px"]):
+                    clash = True
+                    break
+            if not clash:
+                merged.append(cand)
+
+        # A circle that swallows two accepted centres is a fused pair, not a
+        # particle, whichever detector produced it.
+        keep = []
+        for p in merged:
+            inside = sum(
+                1
+                for q in merged
+                if q is not p
+                and np.hypot(p["center_x"] - q["center_x"],
+                             p["center_y"] - q["center_y"]) < p["radius_px"]
+            )
+            if inside >= 2:
+                p["excluded"] = True
+                p["approx"] = False
+                rejected.append(p)
+            else:
+                keep.append(p)
+        return keep + rejected
 
     @staticmethod
     def _dedup(particles, med):
