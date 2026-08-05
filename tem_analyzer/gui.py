@@ -1,5 +1,10 @@
 import sys
 import os
+
+from . import qt_bootstrap
+
+qt_bootstrap.configure()  # must run before Qt is loaded
+
 import cv2
 import numpy as np
 from PyQt5.QtWidgets import (
