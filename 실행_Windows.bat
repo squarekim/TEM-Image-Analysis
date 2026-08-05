@@ -8,15 +8,23 @@ echo   TEM Particle Analyzer
 echo ============================================
 echo.
 
+rem "python" alone can resolve to the Microsoft Store stub, which exits without
+rem running anything, so each candidate has to prove it can execute code.
 set PY=
-py -3 --version >nul 2>&1 && set PY=py -3
-if not defined PY python --version >nul 2>&1 && set PY=python
+for %%C in ("py -3" "python" "python3") do (
+    if not defined PY (
+        %%~C -c "print('ok')" >nul 2>&1 && set "PY=%%~C"
+    )
+)
 if not defined PY (
-    echo [오류] 파이썬을 찾을 수 없습니다.
+    echo [오류] 파이썬이 설치되어 있지 않습니다.
     echo.
-    echo   1^) https://www.python.org/downloads/ 에서 파이썬을 설치하세요.
-    echo   2^) 설치 화면 맨 아래 "Add python.exe to PATH" 를 반드시 체크하세요.
-    echo   3^) 설치 후 이 파일을 다시 실행하세요.
+    echo   1^) https://www.python.org/downloads/ 접속
+    echo   2^) 노란색 "Download Python" 버튼 클릭해서 설치 파일 받기
+    echo   3^) 받은 파일 실행 후, 첫 화면 맨 아래
+    echo      "Add python.exe to PATH" 체크박스를 반드시 체크하세요. ^(중요^)
+    echo   4^) "Install Now" 클릭
+    echo   5^) 설치가 끝나면 이 파일을 다시 더블클릭하세요.
     echo.
     pause
     exit /b 1
