@@ -272,8 +272,10 @@ class MainWindow(QMainWindow):
         param_form.addRow(self.chk_watershed)
 
         self.chk_hollow = QCheckBox("Hollow 입자 모드")
-        self.chk_hollow.setChecked(False)
-        self.chk_hollow.setToolTip("속이 빈 입자 (실리카 등)의 링 형태를 채워서 검출")
+        self.chk_hollow.setChecked(True)
+        self.chk_hollow.setToolTip(
+            "속이 빈 입자(실리카 등)의 링 형태를 채워서 검출합니다.\n"
+            "일반 입자에서도 손해가 없으므로 켜 두어도 됩니다.")
         param_form.addRow(self.chk_hollow)
 
         self.chk_core = QCheckBox("코어 검출 (Yolk-shell)")

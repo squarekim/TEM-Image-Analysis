@@ -189,22 +189,25 @@ class ParticleAnalyzer:
                                                     min_area_px, circularity_thresh)
                 particles.extend(separated)
 
-        if not hollow:
-            hough_particles = self._detect_hough(analysis_region, min_area_px)
-            hough_valid = [p for p in hough_particles if not p.get("excluded")]
-            if hough_valid and particles:
-                px_areas = [np.pi * p["radius_px"] ** 2 for p in particles]
-                hough_areas = [np.pi * p["radius_px"] ** 2 for p in hough_valid]
-                contour_median = np.median(px_areas)
-                hough_median = np.median(hough_areas)
-                if hough_median > contour_median * 3:
-                    particles = hough_particles
-                elif len(hough_valid) > len(particles) * 1.5:
-                    particles = hough_particles
-                elif len(particles) < 3:
-                    particles = hough_particles
-            elif hough_valid and not particles:
+        # The seed-and-trace path runs in every mode: `hollow` only changes how
+        # the binary for the contour path above is built, and on real hollow
+        # images that binary often yields nothing, so gating this on `hollow`
+        # left exactly those images with no particles at all.
+        hough_particles = self._detect_hough(analysis_region, min_area_px)
+        hough_valid = [p for p in hough_particles if not p.get("excluded")]
+        if hough_valid and particles:
+            px_areas = [np.pi * p["radius_px"] ** 2 for p in particles]
+            hough_areas = [np.pi * p["radius_px"] ** 2 for p in hough_valid]
+            contour_median = np.median(px_areas)
+            hough_median = np.median(hough_areas)
+            if hough_median > contour_median * 3:
                 particles = hough_particles
+            elif len(hough_valid) > len(particles) * 1.5:
+                particles = hough_particles
+            elif len(particles) < 3:
+                particles = hough_particles
+        elif hough_valid and not particles:
+            particles = hough_particles
 
         if scalebar_rect:
             sx, sy, sw, sh = scalebar_rect
