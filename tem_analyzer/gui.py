@@ -13,8 +13,8 @@ from PyQt5.QtWidgets import (
     QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox, QSplitter,
     QMessageBox, QHeaderView, QComboBox, QCheckBox,
 )
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import openpyxl
@@ -32,36 +32,82 @@ class ImageLabel(QLabel):
         self.setStyleSheet("border: 1px solid #ccc; background: #222;")
         self._pixmap = None
         self.click_callback = None
+        self.measure_callback = None
+        self.measure_mode = False
+        self._drag_start = None
+        self._drag_end = None
 
     def set_image(self, pixmap):
         self._pixmap = pixmap
+        self._drag_start = self._drag_end = None
         self._update_display()
 
+    def _scaled(self):
+        return self._pixmap.scaled(
+            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+
     def _update_display(self):
-        if self._pixmap:
-            scaled = self._pixmap.scaled(
-                self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            super().setPixmap(scaled)
+        if not self._pixmap:
+            return
+        scaled = self._scaled()
+        if self._drag_start and self._drag_end:
+            scaled = scaled.copy()
+            painter = QPainter(scaled)
+            off = self._offset(scaled)
+            pen = QPen(QColor(255, 60, 60), 2)
+            painter.setPen(pen)
+            a = self._drag_start - off
+            b = self._drag_end - off
+            painter.drawLine(a, b)
+            for end in (a, b):
+                painter.drawLine(end.x(), end.y() - 6, end.x(), end.y() + 6)
+            painter.end()
+        super().setPixmap(scaled)
+
+    def _offset(self, scaled):
+        return QPoint(int((self.width() - scaled.width()) / 2),
+                      int((self.height() - scaled.height()) / 2))
+
+    def _to_image_coords(self, pos):
+        scaled = self._scaled()
+        off = self._offset(scaled)
+        px, py = pos.x() - off.x(), pos.y() - off.y()
+        if not (0 <= px < scaled.width() and 0 <= py < scaled.height()):
+            return None
+        return (px * self._pixmap.width() / scaled.width(),
+                py * self._pixmap.height() / scaled.height())
 
     def resizeEvent(self, event):
         self._update_display()
         super().resizeEvent(event)
 
     def mousePressEvent(self, event):
-        if self._pixmap and self.click_callback:
-            scaled = self._pixmap.scaled(
-                self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            off_x = (self.width() - scaled.width()) / 2
-            off_y = (self.height() - scaled.height()) / 2
-            px = event.pos().x() - off_x
-            py = event.pos().y() - off_y
-            if 0 <= px < scaled.width() and 0 <= py < scaled.height():
-                ix = px * self._pixmap.width() / scaled.width()
-                iy = py * self._pixmap.height() / scaled.height()
-                self.click_callback(ix, iy)
+        if self._pixmap and self.measure_mode:
+            self._drag_start = event.pos()
+            self._drag_end = event.pos()
+            self._update_display()
+        elif self._pixmap and self.click_callback:
+            coords = self._to_image_coords(event.pos())
+            if coords:
+                self.click_callback(*coords)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.measure_mode and self._drag_start:
+            self._drag_end = event.pos()
+            self._update_display()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.measure_mode and self._drag_start:
+            self._drag_end = event.pos()
+            self._update_display()
+            start = self._to_image_coords(self._drag_start)
+            end = self._to_image_coords(self._drag_end)
+            if start and end and self.measure_callback:
+                self.measure_callback(start, end)
+        super().mouseReleaseEvent(event)
 
 
 class HistogramCanvas(FigureCanvas):
@@ -145,6 +191,7 @@ class MainWindow(QMainWindow):
 
         self.image_label = ImageLabel()
         self.image_label.click_callback = self._on_image_click
+        self.image_label.measure_callback = self._on_scalebar_measured
         left_layout.addWidget(self.image_label, stretch=3)
 
         self.histogram = HistogramCanvas()
@@ -170,6 +217,14 @@ class MainWindow(QMainWindow):
         self.spin_bar_px.setValue(100)
         self.spin_bar_px.setEnabled(False)
         scale_form.addRow("스케일바 길이 (px):", self.spin_bar_px)
+
+        self.btn_measure = QPushButton("이미지에서 스케일바 재기")
+        self.btn_measure.setCheckable(True)
+        self.btn_measure.setEnabled(False)
+        self.btn_measure.setToolTip(
+            "누른 뒤 이미지 위의 스케일바 양 끝을 드래그하면 픽셀 길이가 자동 입력됩니다")
+        self.btn_measure.toggled.connect(self._toggle_measure_mode)
+        scale_form.addRow(self.btn_measure)
 
         self.spin_bar_real = QDoubleSpinBox()
         self.spin_bar_real.setRange(0.01, 100000)
@@ -267,8 +322,33 @@ class MainWindow(QMainWindow):
         self.spin_bar_px.setEnabled(checked)
         self.spin_bar_real.setEnabled(checked)
         self.combo_unit.setEnabled(checked)
+        self.btn_measure.setEnabled(checked and self.original_image is not None)
+        if not checked:
+            self.btn_measure.setChecked(False)
         if checked:
             self.scale_status.setText("수동 입력 모드")
+
+    def _toggle_measure_mode(self, checked):
+        self.image_label.measure_mode = checked
+        self.image_label.setCursor(Qt.CrossCursor if checked else Qt.ArrowCursor)
+        if checked:
+            self.statusBar().showMessage(
+                "이미지 위의 스케일바 왼쪽 끝에서 오른쪽 끝까지 드래그하세요.")
+
+    def _on_scalebar_measured(self, start, end):
+        scale = getattr(self, "_display_scale", 1.0) or 1.0
+        dx = (end[0] - start[0]) / scale
+        dy = (end[1] - start[1]) / scale
+        length = float(np.hypot(dx, dy))
+        if length < 2:
+            return
+        self.spin_bar_px.setValue(length)
+        self.btn_measure.setChecked(False)
+        real = self.spin_bar_real.value()
+        unit = self.combo_unit.currentText()
+        self.statusBar().showMessage(
+            f"스케일바 길이 {length:.1f} px 측정됨. "
+            f"'실제 길이'가 {real:g} {unit}가 맞는지 확인하세요.")
 
     def _load_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -300,7 +380,10 @@ class MainWindow(QMainWindow):
 
         self._display_image(self.image)
         self.btn_analyze.setEnabled(True)
-        self.statusBar().showMessage(f"이미지 로드 완료: {os.path.basename(path)}")
+        self.btn_measure.setEnabled(self.chk_manual.isChecked())
+        self.statusBar().showMessage(
+            f"이미지 로드 완료: {os.path.basename(path)}  —  "
+            "'이미지에서 스케일바 재기'로 배율을 먼저 맞추세요.")
 
     def _run_analysis(self):
         if self.image is None:
@@ -432,7 +515,7 @@ class MainWindow(QMainWindow):
     def _on_image_click(self, ix, iy):
         if not self.particles or "has_core" not in (self.particles[0] if self.particles else {}):
             return
-        scale = getattr(self, "_result_scale", 1)
+        scale = getattr(self, "_display_scale", 1.0) or 1.0
         ox, oy = ix / scale, iy / scale
         best = None
         best_d = None
@@ -468,6 +551,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"결과 이미지 저장 완료: {path}")
 
     def _display_image(self, cv_img):
+        # The result view is rendered at an integer upscale, so remember the
+        # factor that maps what is on screen back to original image pixels.
+        if self.original_image is not None:
+            self._display_scale = cv_img.shape[1] / self.original_image.shape[1]
+        else:
+            self._display_scale = 1.0
         if len(cv_img.shape) == 2:
             h, w = cv_img.shape
             qimg = QImage(cv_img.data, w, h, w, QImage.Format_Grayscale8)
