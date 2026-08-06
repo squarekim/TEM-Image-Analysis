@@ -562,6 +562,81 @@ class ParticleAnalyzer:
         return h
 
     @staticmethod
+    def snap_scalebar(image, start, end):
+        """Refine a rough drag along a scale bar to the bar's true extent.
+
+        A hand drag over a 60-100 px bar is easily a couple of pixels short or
+        long, and that error multiplies into every diameter, so the drag is
+        only used to locate the bar: its actual ends are then read from the
+        image. Returns the refined length in pixels, or None when no bar-like
+        run is found under the drag.
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        h, w = gray.shape
+        (x0, y0), (x1, y1) = start, end
+        length = np.hypot(x1 - x0, y1 - y0)
+        if length < 8 or abs(x1 - x0) < abs(y1 - y0):
+            return None  # scale bars are horizontal; a vertical drag is not one
+
+        # Scan a window around the drag row by row: the bar is often only a
+        # couple of pixels tall, so the drag itself may not lie on it.
+        pad = max(6, int(length * 0.2))
+        ry0, ry1 = max(0, int(min(y0, y1)) - pad), min(h, int(max(y0, y1)) + pad + 1)
+        rx0, rx1 = max(0, int(min(x0, x1)) - pad), min(w, int(max(x0, x1)) + pad + 1)
+        roi = gray[ry0:ry1, rx0:rx1]
+        if roi.size == 0 or roi.shape[1] < 8:
+            return None
+
+        drag_lo, drag_hi = int(min(x0, x1)) - rx0, int(max(x0, x1)) - rx0
+        best = None
+        for dark_bar in (True, False):
+            level = np.percentile(roi, 25 if dark_bar else 75)
+            mask = roi < level if dark_bar else roi > level
+            for ri, on in enumerate(mask):
+                idx = np.flatnonzero(np.diff(np.r_[0, on.view(np.int8), 0]))
+                if len(idx) < 2:
+                    continue
+                for s, e in zip(idx[::2], idx[1::2]):
+                    run = e - s
+                    # the run has to be roughly what the user pointed at
+                    if run < 8 or run > length * 1.6 or run < length * 0.5:
+                        continue
+                    overlap = min(e, drag_hi) - max(s, drag_lo)
+                    if overlap < 0.6 * min(run, drag_hi - drag_lo + 1):
+                        continue
+                    # A scale bar is a thin horizontal rule; a particle edge
+                    # produces a run too, but sits in a tall dark region.
+                    col = mask[:, (s + e) // 2]
+                    top = bottom = ri
+                    while top > 0 and col[top - 1]:
+                        top -= 1
+                    while bottom < len(col) - 1 and col[bottom + 1]:
+                        bottom += 1
+                    if (bottom - top + 1) > max(6, run * 0.35):
+                        continue
+
+                    # Sub-pixel ends: interpolate where the profile crosses the
+                    # midpoint between bar and background, so a bar does not
+                    # round to whole pixels.
+                    prof = roi[ri].astype(np.float32)
+                    inside = prof[s:e].mean()
+                    outside = np.concatenate([prof[max(0, s - 4):s], prof[e:e + 4]])
+                    refined = float(run)
+                    if outside.size:
+                        half = (inside + outside.mean()) / 2
+                        left, right = float(s), float(e - 1)
+                        if s > 0 and prof[s - 1] != prof[s]:
+                            left = s - 1 + (half - prof[s - 1]) / (prof[s] - prof[s - 1])
+                        if e < len(prof) and prof[e] != prof[e - 1]:
+                            right = e - 1 + (half - prof[e - 1]) / (prof[e] - prof[e - 1])
+                        if right > left:
+                            refined = right - left
+
+                    if best is None or refined > best:
+                        best = refined
+        return float(best) if best else None
+
+    @staticmethod
     def _find_scalebar_rect(gray):
         h, w = gray.shape
         y0 = int(h * 0.8)

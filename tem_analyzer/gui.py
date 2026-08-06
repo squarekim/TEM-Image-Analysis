@@ -339,18 +339,27 @@ class MainWindow(QMainWindow):
 
     def _on_scalebar_measured(self, start, end):
         scale = getattr(self, "_display_scale", 1.0) or 1.0
-        dx = (end[0] - start[0]) / scale
-        dy = (end[1] - start[1]) / scale
-        length = float(np.hypot(dx, dy))
+        p0 = (start[0] / scale, start[1] / scale)
+        p1 = (end[0] / scale, end[1] / scale)
+        length = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
         if length < 2:
             return
-        self.spin_bar_px.setValue(length)
-        self.btn_measure.setChecked(False)
+
+        # A couple of pixels of drag error multiply into every diameter, so
+        # snap to the bar actually under the drag where one can be found.
+        snapped = ParticleAnalyzer.snap_scalebar(self.original_image, p0, p1)
         real = self.spin_bar_real.value()
         unit = self.combo_unit.currentText()
+        if snapped:
+            self.spin_bar_px.setValue(snapped)
+            note = f"드래그 {length:.1f} px → 스케일바에 맞춤 {snapped:.1f} px."
+        else:
+            self.spin_bar_px.setValue(length)
+            note = (f"스케일바 길이 {length:.1f} px (드래그 값 그대로 사용 — "
+                    "이미지에서 막대를 찾지 못했습니다).")
+        self.btn_measure.setChecked(False)
         self.statusBar().showMessage(
-            f"스케일바 길이 {length:.1f} px 측정됨. "
-            f"'실제 길이'가 {real:g} {unit}가 맞는지 확인하세요.")
+            f"{note}  '실제 길이'가 {real:g} {unit}가 맞는지 확인하세요.")
 
     def _load_image(self):
         path, _ = QFileDialog.getOpenFileName(
