@@ -291,7 +291,6 @@ class ParticleAnalyzer:
         if best is None:
             return []
 
-        polarity = self._contrast_polarity(seed_img, best)
         seeds = [(int(cx), int(cy), int(r)) for cx, cy, r in best]
         med = float(np.median([s[2] for s in seeds]))
 
@@ -305,20 +304,24 @@ class ParticleAnalyzer:
             expanded.append((cx, cy, r))
 
         traces = []
-        all_scores = []
+        strong_scores, outer_scores = [], []
         for cx, cy, r in expanded:
-            trace = self._trace_boundary(gx, gy, cx, cy, r, w, h,
-                                         polarity=polarity)
+            trace = self._trace_boundary(gx, gy, cx, cy, r, w, h)
             traces.append(trace)
-            all_scores.extend(trace[2][trace[2] > 0])
-        if not all_scores:
+            strong_scores.extend(trace[2][trace[2] > 0])
+            outer_scores.extend(trace[4][trace[4] > 0])
+        if not strong_scores:
             return []
-        score_thresh = np.percentile(all_scores, 30)
+        # The outer transition of a rim is the weaker of the two, so judging it
+        # against the strong edges' threshold would discard nearly all of it.
+        score_thresh = np.percentile(strong_scores, 30)
+        outer_thresh = score_thresh * 0.4
 
         particles = []
-        for (cx, cy, r), (angles, r_ang, s_ang) in zip(expanded, traces):
-            fit = self._robust_circle_fit(cx, cy, angles, r_ang, s_ang,
-                                          score_thresh, r0=r)
+        for (cx, cy, r), trace in zip(expanded, traces):
+            angles = trace[0]
+            fit, r_ang, s_ang, used_thresh = self._choose_boundary(
+                cx, cy, angles, trace, score_thresh, r, outer_thresh, blurred)
             if fit is None:
                 continue
             ux, uy, rr, coverage, rms, pts = fit
@@ -332,20 +335,12 @@ class ParticleAnalyzer:
             rys = uy + rr * np.sin(ring)
             ring_inside = ((rxs >= 0) & (rxs < w) & (rys >= 0) & (rys < h)).mean()
 
-            good = (s_ang > score_thresh) & ~np.isnan(r_ang)
+            good = (s_ang > used_thresh) & ~np.isnan(r_ang)
             r_from_fit = np.hypot(cx + np.where(np.isnan(r_ang), 0, r_ang) * np.cos(angles) - ux,
                                   cy + np.where(np.isnan(r_ang), 0, r_ang) * np.sin(angles) - uy)
             spread = self._smoothed_spread(r_from_fit, good)
 
-            # A real particle stands out from what surrounds it, in the
-            # direction the image's polarity says. A circle drawn over
-            # background or across a gap fails this even when its arc happens
-            # to fit, which is how noise survives the geometric tests.
-            contrast = self._edge_contrast(blurred, ux, uy, rr, w, h)
-            has_body = contrast is not None and polarity * contrast > 3.0
-
-            usable = (center_inside and ring_inside >= 0.5 and spread <= 1.6
-                      and has_body)
+            usable = center_inside and ring_inside >= 0.5 and spread <= 1.6
             if usable and coverage >= 0.5 and rms <= 0.10:
                 p["approx"] = False
                 p["excluded"] = False
@@ -373,51 +368,6 @@ class ParticleAnalyzer:
                     p["approx"] = False
                     q["approx"] = False
         return particles
-
-    @staticmethod
-    def _edge_contrast(blurred, cx, cy, r, w, h):
-        """Outside-minus-inside brightness across a circle's boundary.
-
-        Positive means the circle is darker than what surrounds it. Returns
-        None when too much of either ring falls outside the frame.
-        """
-        angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
-        cos_a, sin_a = np.cos(angles), np.sin(angles)
-        samples = []
-        for frac in (0.85, 1.15):
-            xs = (cx + r * frac * cos_a).astype(int)
-            ys = (cy + r * frac * sin_a).astype(int)
-            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-            if v.sum() < len(angles) * 0.5:
-                return None
-            samples.append(float(np.median(blurred[ys[v], xs[v]])))
-        return samples[1] - samples[0]
-
-    @staticmethod
-    def _contrast_polarity(blurred, circles):
-        """+1 when particles are darker than their surroundings, else -1.
-
-        Read straight off the candidate circles by comparing a ring just inside
-        the boundary with one just outside. Hough locates circles from gradient
-        magnitude alone, so its output is available before the edge direction
-        has to be decided. Sampling near the boundary rather than at the centre
-        keeps hollow particles - whose cavity is bright but whose shell is not -
-        on the right side of the comparison.
-        """
-        h, w = blurred.shape
-        angles = np.linspace(0, 2 * np.pi, 32, endpoint=False)
-        cos_a, sin_a = np.cos(angles), np.sin(angles)
-        inside, outside = [], []
-        for cx, cy, r in circles[:24]:
-            for frac, bucket in ((0.85, inside), (1.15, outside)):
-                xs = (cx + r * frac * cos_a).astype(int)
-                ys = (cy + r * frac * sin_a).astype(int)
-                v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-                if v.sum() >= len(angles) * 0.5:
-                    bucket.append(np.median(blurred[ys[v], xs[v]]))
-        if not inside or not outside:
-            return 1.0
-        return 1.0 if np.median(inside) < np.median(outside) else -1.0
 
     @staticmethod
     def _smooth_for_scale(gray, default, radius, factor=0.04):
@@ -488,40 +438,115 @@ class ParticleAnalyzer:
 
             gx, gy = self._gradients(gray, mid)
             sample = circles[:16]
-            # Polarity is not known yet, so score the band under both and keep
-            # whichever reading makes the edges look more like particles.
-            for polarity in (1.0, -1.0):
-                traces = [self._trace_boundary(gx, gy, int(cx), int(cy), int(r),
-                                               w, h, polarity=polarity)
-                          for cx, cy, r in sample]
-                scores = [s for _, _, s_ang in traces for s in s_ang[s_ang > 0]]
-                if not scores:
-                    continue
-                thresh = np.percentile(scores, 30)
-                passed = 0
-                for (cx, cy, r), (angles, r_ang, s_ang) in zip(sample, traces):
-                    fit = self._robust_circle_fit(int(cx), int(cy), angles, r_ang,
-                                                  s_ang, thresh, r0=int(r))
-                    if fit and fit[3] >= 0.5 and fit[4] <= 0.10:
-                        passed += 1
+            traces = [self._trace_boundary(gx, gy, int(cx), int(cy), int(r), w, h)
+                      for cx, cy, r in sample]
+            scores = [v for _, _, s_ang, _, _ in traces for v in s_ang[s_ang > 0]]
+            if not scores:
+                continue
+            thresh = np.percentile(scores, 30)
+            passed = 0
+            for (cx, cy, r), trace in zip(sample, traces):
+                fit = self._robust_circle_fit(int(cx), int(cy), trace[0],
+                                              trace[1], trace[2], thresh,
+                                              r0=int(r))
+                if fit and fit[3] >= 0.5 and fit[4] <= 0.10:
+                    passed += 1
 
-                # Scale the validated fraction by the population so a band with
-                # a few solid circles beats one with many unconvincing ones.
-                score = (passed / len(sample)) * len(circles)
-                if score > best_score:
-                    best_score = score
-                    best_est = self._radius_mode(circles[:, 2])
+            # Scale the validated fraction by the population so a band with a
+            # few solid circles beats one with many unconvincing ones.
+            score = (passed / len(sample)) * len(circles)
+            if score > best_score:
+                best_score = score
+                best_est = self._radius_mode(circles[:, 2])
         return best_est
 
     @staticmethod
-    def _trace_boundary(gx, gy, cx, cy, r0, w, h, n_angles=96, polarity=1.0):
+    def _has_rim_between(blurred, cx, cy, r_inner, r_outer):
+        """True when a distinct band sits between the two candidate radii.
+
+        A particle ringed by a rim shows two transitions with the rim's own
+        brightness between them. A single soft edge also produces a second,
+        weaker crest further out - just a ripple of the same transition - and
+        there the profile runs straight from one radius to the other. Requiring
+        a genuine extremum in between separates the two.
+        """
+        h, w = blurred.shape
+        if r_outer - r_inner < 2:
+            return False
+        radii = np.linspace(r_inner, r_outer, 12)
+        angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+        levels = []
+        for r in radii:
+            xs = (cx + r * np.cos(angles)).astype(int)
+            ys = (cy + r * np.sin(angles)).astype(int)
+            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            if v.sum() < len(angles) * 0.5:
+                return False
+            levels.append(float(np.median(blurred[ys[v], xs[v]])))
+        levels = np.array(levels)
+        # Deviation from the straight line joining the endpoints. A single
+        # transition runs monotonically between the two radii and hugs that
+        # line; a rim bulges away from it.
+        line = np.linspace(levels[0], levels[-1], len(levels))
+        deviation = np.abs(levels - line).max()
+        span = max(abs(levels[0] - levels[-1]), 1.0)
+        return deviation > 0.3 * span + 8.0
+
+    def _choose_boundary(self, cx, cy, angles, trace, score_thresh, r0,
+                         outer_thresh=None, blurred=None):
+        """Fit the outer transition when it holds up, else the strongest one.
+
+        A particle ringed by a dark rim offers two transitions and the outer
+        one is the boundary a person measures, but on a plainly edged particle
+        the outermost crest above threshold is often just noise. Fitting both
+        and comparing settles it: a real outer rim is circular and fits about
+        as well as the strong edge, whereas noise does not.
+        """
+        _, r_strong, s_strong, r_outer, s_outer = trace
+        if outer_thresh is None:
+            outer_thresh = score_thresh
+        strong = self._robust_circle_fit(cx, cy, angles, r_strong, s_strong,
+                                         score_thresh, r0=r0)
+        outer = self._robust_circle_fit(cx, cy, angles, r_outer, s_outer,
+                                        outer_thresh, r0=r0)
+        if outer is None:
+            return strong, r_strong, s_strong, score_thresh
+        if strong is None:
+            return outer, r_outer, s_outer, outer_thresh
+        if outer[2] <= strong[2] + 0.5:
+            # no further out; nothing to gain
+            return strong, r_strong, s_strong, score_thresh
+        # Only trust the outer transition when it is a coherent rim in its own
+        # right: seen around most of the particle, circular to the same standard
+        # demanded of an ordinary edge, and carrying a real share of the edge
+        # strength. Noise clears the geometric tests often enough on its own.
+        live_outer = s_outer[s_outer > 0]
+        live_strong = s_strong[s_strong > 0]
+        if live_outer.size and live_strong.size:
+            strength_ratio = np.median(live_outer) / max(np.median(live_strong), 1e-6)
+        else:
+            strength_ratio = 0.0
+        if (outer[3] >= 0.55 and outer[4] <= 0.10
+                and outer[3] >= strong[3] * 0.8 and strength_ratio >= 0.35
+                and (blurred is None
+                     or self._has_rim_between(blurred, cx, cy, strong[2], outer[2]))):
+            return outer, r_outer, s_outer, outer_thresh
+        return strong, r_strong, s_strong, score_thresh
+
+    @staticmethod
+    def _trace_boundary(gx, gy, cx, cy, r0, w, h, n_angles=96):
         """Follow the particle edge outward along rays from (cx, cy).
 
-        ``polarity`` is +1 when particles are darker than their surroundings -
-        the usual mass-thickness contrast - and -1 when they are brighter, as
-        in images where particles are separated by dark boundaries. With the
-        wrong sign the search runs past the true edge looking for a rise in
-        brightness that only comes at the next particle.
+        The edge is taken as the outermost strong intensity transition, not the
+        strongest one. Particles outlined by a dark rim cross two transitions
+        going outward - into the rim and out of it - and the outer one is the
+        boundary a person measures. Choosing by strength alone can land on
+        either, and which one it picks flips with the rim's shape.
+
+        Working from the outermost transition also avoids having to decide
+        whether particles are darker or brighter than their surroundings, which
+        is not even well defined when the interior and the gaps between
+        particles are equally bright and only the rim stands out.
         """
         angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
         radii = np.arange(max(2, r0 * 0.55), r0 * 1.5, 0.5)
@@ -533,15 +558,33 @@ class ParticleAnalyzer:
 
         rows = np.clip(ys, 0, h - 1)
         cols = np.clip(xs, 0, w - 1)
-        outward = polarity * (gx[rows, cols] * cos_a[:, None]
-                              + gy[rows, cols] * sin_a[:, None])
-        outward = np.where(valid, outward, -np.inf)
+        radial = (gx[rows, cols] * cos_a[:, None] + gy[rows, cols] * sin_a[:, None])
+        strength = np.where(valid, np.abs(radial), 0.0)
 
-        best = np.argmax(outward, axis=1)
-        enough = valid.sum(axis=1) >= len(radii) * 0.5
-        r_best = np.where(enough, radii[best], np.nan)
-        s_best = np.where(enough, outward[np.arange(n_angles), best], 0.0)
-        return angles, r_best, s_best
+        peak = strength.max(axis=1)
+        enough = (peak > 0) & (valid.sum(axis=1) >= len(radii) * 0.5)
+        rows_idx = np.arange(n_angles)
+
+        strongest = np.argmax(strength, axis=1)
+
+        # Crest of a transition, not its tail: the outermost sample that merely
+        # clears the threshold sits on the fading flank of the gradient and
+        # reads a radius that is systematically too large.
+        crest = np.zeros_like(strength, dtype=bool)
+        crest[:, 1:-1] = ((strength[:, 1:-1] >= strength[:, :-2])
+                          & (strength[:, 1:-1] >= strength[:, 2:]))
+        crest[:, 0] = crest[:, -1] = True
+        significant = crest & (strength >= np.maximum(peak * 0.5, 1e-6)[:, None])
+        outermost = strength.shape[1] - 1 - np.argmax(significant[:, ::-1], axis=1)
+        has_outer = significant.any(axis=1)
+
+        def pick(index, ok):
+            return (np.where(ok, radii[index], np.nan),
+                    np.where(ok, strength[rows_idx, index], 0.0))
+
+        r_strong, s_strong = pick(strongest, enough)
+        r_outer, s_outer = pick(outermost, enough & has_outer)
+        return angles, r_strong, s_strong, r_outer, s_outer
 
     @staticmethod
     def _smoothed_spread(r_ang, good, win=5):

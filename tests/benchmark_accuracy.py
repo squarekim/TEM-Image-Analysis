@@ -18,6 +18,7 @@ from tests.generate_fringed_image import generate_fringed_image  # noqa: E402
 from tests.generate_grainy_image import generate_grainy_image  # noqa: E402
 from tests.generate_hard_image import generate_hard_tem_image  # noqa: E402
 from tests.generate_hollow_image import generate_hollow_tem_image  # noqa: E402
+from tests.generate_rimmed_image import generate_rimmed_image  # noqa: E402
 from tests.generate_test_image import generate_tem_image  # noqa: E402
 from tests.generate_touching_image import generate_touching_image  # noqa: E402
 
@@ -82,6 +83,8 @@ def main():
          lambda p: generate_grainy_image(p)),
         ("fringed", "fringed.png",
          lambda p: generate_fringed_image(p)),
+        ("rimmed", "rimmed.png",
+         lambda p: generate_rimmed_image(p)),
     ]
 
     results = {}
