@@ -105,5 +105,61 @@ print("\n최소 배율은 '맞춤' 이하로 내려가지 않음")
 label.set_zoom(0.2)
 check("clamp", label._zoom, 1.0)
 
+print("\n측정선이 확대/이동을 따라감")
+label.reset_view()
+label.measure_mode = True
+measured.clear()
+press, release = QPoint(200, 200), QPoint(600, 200)
+label.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(press),
+                                  Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+label.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(release),
+                                    Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+start_img = label._drag_start
+on_screen_before = label._to_widget(start_img)
+label.set_zoom(4.0)
+on_screen_after = label._to_widget(label._drag_start)
+check("확대해도 같은 이미지 지점", label._drag_start[0], start_img[0], 0.01)
+moved = abs(on_screen_after.x() - on_screen_before.x())
+print(f"        (화면 위치는 {moved} px 이동 — 이미지를 따라간다는 뜻)")
+check("화면 위치가 이미지와 함께 이동", moved > 10, True)
+
+print("\n이미지 밖으로 나간 드래그도 측정됨 (가장자리로 클램프)")
+label.reset_view()
+measured.clear()
+label.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(400, 200),
+                                  Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+label.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(-50, 200),
+                                    Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+check("측정 콜백 호출", len(measured), 1)
+check("끝점이 이미지 왼쪽 가장자리", measured[0][1][0], 0.0, 0.01)
+
+print("\n두 번 클릭으로 창보다 넓은 막대 측정")
+label.reset_view()
+label.set_zoom(8.0)   # image is now far wider than the widget
+measured.clear()
+anchors = []
+label.anchor_callback = anchors.append
+first = QPoint(label.width() // 2, label.height() // 2)
+label.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(first),
+                                  Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+label.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(first),
+                                    Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+check("첫 클릭은 측정이 아니라 끝점 지정", len(measured), 0)
+check("끝점 지정 알림", anchors[-1], True)
+anchor_img = label._anchor
+# pan far to the right, then click the second end
+label._pan = QPoint(label._pan.x() - 400, label._pan.y())
+label._clamp_pan()
+second = QPoint(label.width() // 2, label.height() // 2)
+label.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(second),
+                                  Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+label.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(second),
+                                    Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+check("두 번째 클릭에서 측정 완료", len(measured), 1)
+check("시작점은 첫 클릭 지점", measured[0][0][0], anchor_img[0], 0.01)
+spanned = measured[0][1][0] - measured[0][0][0]
+print(f"        (측정 길이 {spanned:.1f} 원본 px — 한 화면에 안 들어가는 구간)")
+check("두 클릭이 실제로 떨어져 있음", spanned > 20, True)
+
 print("\n" + ("전체 통과" if not fails else f"실패: {fails}"))
 sys.exit(1 if fails else 0)

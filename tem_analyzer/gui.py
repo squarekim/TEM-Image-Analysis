@@ -36,8 +36,13 @@ class ImageLabel(QLabel):
         self.measure_callback = None
         self.measuring_callback = None
         self.measure_mode = False
+        # Measurement endpoints live in original-image coordinates, not widget
+        # ones, so the line stays on the same part of the image when the view
+        # zooms or pans underneath it.
         self._drag_start = None
         self._drag_end = None
+        self._anchor = None       # first end of a pending two-click measurement
+        self.anchor_callback = None
         self.zoom_callback = None
         self._zoom = 1.0          # 1.0 = fit the whole image in the widget
         self._pan = QPoint(0, 0)  # offset from centred, in widget pixels
@@ -52,7 +57,7 @@ class ImageLabel(QLabel):
     def set_image(self, pixmap, reset_view=True, source_scale=1.0):
         self._pixmap = pixmap
         self.source_scale = source_scale or 1.0
-        self._drag_start = self._drag_end = None
+        self._drag_start = self._drag_end = self._anchor = None
         if reset_view:
             self._zoom = 1.0
             self._pan = QPoint(0, 0)
@@ -147,11 +152,18 @@ class ImageLabel(QLabel):
                                   target.width() <= self._pixmap.width() * 1.5)
             painter.drawPixmap(visible, self._pixmap, source)
 
+        painter.setPen(QPen(QColor(255, 60, 60), 2))
         if self._drag_start and self._drag_end:
-            painter.setPen(QPen(QColor(255, 60, 60), 2))
-            painter.drawLine(self._drag_start, self._drag_end)
-            for end in (self._drag_start, self._drag_end):
+            a, b = self._to_widget(self._drag_start), self._to_widget(self._drag_end)
+            painter.drawLine(a, b)
+            for end in (a, b):
                 painter.drawLine(end.x(), end.y() - 6, end.x(), end.y() + 6)
+        elif self._anchor:
+            # A placed first end, waiting for the second one; the user may zoom
+            # and pan in between, so mark where it is.
+            a = self._to_widget(self._anchor)
+            painter.drawLine(a.x(), a.y() - 8, a.x(), a.y() + 8)
+            painter.drawLine(a.x() - 8, a.y(), a.x() + 8, a.y())
 
     def _centre_offset(self):
         scaled = self._scaled_size()
@@ -161,15 +173,31 @@ class ImageLabel(QLabel):
     def _offset(self):
         return self._centre_offset() + self._pan
 
-    def _to_image_coords(self, pos):
-        """Widget point -> original-image pixels, or None if outside the image."""
+    def _to_image_coords(self, pos, clamp=False):
+        """Widget point -> original-image pixels.
+
+        Returns None for a point outside the image unless `clamp` is set, which
+        pulls it to the nearest edge instead - a measurement drag that overshoots
+        the image by a few pixels should still measure, not vanish.
+        """
         scaled = self._scaled_size()
         off = self._offset()
         px, py = pos.x() - off.x(), pos.y() - off.y()
         if not (0 <= px < scaled.width() and 0 <= py < scaled.height()):
-            return None
+            if not clamp:
+                return None
+            px = min(max(px, 0), scaled.width() - 1)
+            py = min(max(py, 0), scaled.height() - 1)
         return (px * self._pixmap.width() / scaled.width() / self.source_scale,
                 py * self._pixmap.height() / scaled.height() / self.source_scale)
+
+    def _to_widget(self, point):
+        """Original-image pixels -> widget point (inverse of _to_image_coords)."""
+        scaled = self._scaled_size()
+        off = self._offset()
+        return QPoint(
+            int(off.x() + point[0] * self.source_scale * scaled.width() / self._pixmap.width()),
+            int(off.y() + point[1] * self.source_scale * scaled.height() / self._pixmap.height()))
 
     def resizeEvent(self, event):
         self._apply_view()
@@ -194,24 +222,37 @@ class ImageLabel(QLabel):
         """
         if not (modifiers & Qt.ShiftModifier) or self._drag_start is None:
             return pos
-        dx = pos.x() - self._drag_start.x()
-        dy = pos.y() - self._drag_start.y()
+        origin = self._to_widget(self._drag_start)
+        dx = pos.x() - origin.x()
+        dy = pos.y() - origin.y()
         if abs(dx) >= abs(dy):
-            return QPoint(pos.x(), self._drag_start.y())
-        return QPoint(self._drag_start.x(), pos.y())
+            return QPoint(pos.x(), origin.y())
+        return QPoint(origin.x(), pos.y())
 
     def _pan_button(self, event):
         """Middle-drag always pans; left-drag pans when not measuring."""
         return (event.buttons() & Qt.MiddleButton
                 or (event.buttons() & Qt.LeftButton and not self.measure_mode))
 
+    def clear_measurement(self, line=True):
+        """Drop a pending first end, and the finished line unless asked to keep it."""
+        self._anchor = None
+        if line:
+            self._drag_start = self._drag_end = None
+        if self.anchor_callback:
+            self.anchor_callback(False)
+        self.update()
+
     def mousePressEvent(self, event):
         if not self._pixmap:
             return super().mousePressEvent(event)
         self._panned = False
         if self.measure_mode and event.button() == Qt.LeftButton:
-            self._drag_start = event.pos()
-            self._drag_end = event.pos()
+            point = self._to_image_coords(event.pos(), clamp=True)
+            # A pending anchor means this press is the far end of a two-click
+            # measurement, so the line runs from there rather than from here.
+            self._drag_start = self._anchor or point
+            self._drag_end = point
             self.update()
         else:
             self._pan_from = (event.pos(), QPoint(self._pan))
@@ -219,14 +260,12 @@ class ImageLabel(QLabel):
 
     def mouseMoveEvent(self, event):
         if self.measure_mode and self._drag_start:
-            self._drag_end = self._constrain(event.pos(), event.modifiers())
+            self._drag_end = self._to_image_coords(
+                self._constrain(event.pos(), event.modifiers()), clamp=True)
             self.update()
             if self.measuring_callback:
-                start = self._to_image_coords(self._drag_start)
-                end = self._to_image_coords(self._drag_end)
-                if start and end:
-                    self.measuring_callback(start, end,
-                                            bool(event.modifiers() & Qt.ShiftModifier))
+                self.measuring_callback(self._drag_start, self._drag_end,
+                                        bool(event.modifiers() & Qt.ShiftModifier))
         elif self._pan_from and self._pan_button(event):
             origin, base = self._pan_from
             delta = event.pos() - origin
@@ -241,12 +280,24 @@ class ImageLabel(QLabel):
 
     def mouseReleaseEvent(self, event):
         if self.measure_mode and self._drag_start:
-            self._drag_end = self._constrain(event.pos(), event.modifiers())
+            self._drag_end = self._to_image_coords(
+                self._constrain(event.pos(), event.modifiers()), clamp=True)
+            start, end = self._drag_start, self._drag_end
+            if math.hypot(end[0] - start[0], end[1] - start[1]) < 2:
+                # Too short to be a drag. Treat it as placing one end: the user
+                # can now zoom and pan to the other end and click again, which
+                # is the only way to measure a bar wider than the window.
+                self._anchor = start
+                self._drag_start = self._drag_end = None
+                if self.anchor_callback:
+                    self.anchor_callback(True)
+            else:
+                self._anchor = None
+                if self.anchor_callback:
+                    self.anchor_callback(False)
+                if self.measure_callback:
+                    self.measure_callback(start, end)
             self.update()
-            start = self._to_image_coords(self._drag_start)
-            end = self._to_image_coords(self._drag_end)
-            if start and end and self.measure_callback:
-                self.measure_callback(start, end)
         elif self._pan_from:
             # A press that didn't move the view is a click, not a pan, so the
             # core toggle still works while the image is zoomed in.
@@ -344,6 +395,7 @@ class MainWindow(QMainWindow):
         self.image_label.click_callback = self._on_image_click
         self.image_label.measure_callback = self._on_scalebar_measured
         self.image_label.measuring_callback = self._on_scalebar_measuring
+        self.image_label.anchor_callback = self._on_measure_anchor
         self.image_label.zoom_callback = self._on_zoom_changed
         left_layout.addWidget(self.image_label, stretch=3)
 
@@ -519,11 +571,28 @@ class MainWindow(QMainWindow):
         self.image_label.measure_mode = checked
         self._measuring_shown = None
         self.image_label.setCursor(Qt.CrossCursor if checked else Qt.ArrowCursor)
-        if checked:
+        if not checked:
+            # Keep the line that was just measured; only a half-finished
+            # two-click measurement is stale here.
+            self.image_label.clear_measurement(line=False)
+            return
+        self.statusBar().showMessage(
+            "스케일바를 따라 드래그하거나, 양 끝을 한 번씩 클릭하세요 "
+            "(클릭 사이에 확대·이동 가능). Shift를 누르면 수평/수직 고정.")
+
+    def _on_measure_anchor(self, pending):
+        if pending:
+            self._measuring_shown = None
             self.statusBar().showMessage(
-                "이미지 위의 스케일바를 따라 드래그하세요. "
-                "Shift를 누른 채 끌면 수평/수직으로 고정됩니다. "
-                "휠로 확대하면 더 정확히 찍을 수 있습니다 (확대 중 이동은 가운데 버튼 드래그).")
+                "한쪽 끝을 찍었습니다. 확대(휠)·이동(가운데 버튼 드래그)한 뒤 "
+                "반대쪽 끝을 클릭하세요. Esc로 취소.")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self.image_label.measure_mode:
+            self.image_label.clear_measurement()
+            self.statusBar().showMessage("측정을 취소했습니다.")
+            return
+        super().keyPressEvent(event)
 
     def _on_zoom_changed(self, percent):
         self.lbl_zoom.setText(f"{percent:.0f}%")
