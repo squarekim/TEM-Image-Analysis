@@ -150,7 +150,7 @@ class ParticleAnalyzer:
 
     def analyze(self, image, min_area_px=100, max_area_px=None,
                 circularity_thresh=0.5, use_watershed=True, hollow=False,
-                detect_cores=False):
+                detect_cores=False, measure_shell=False):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
         cutoff = self._find_scalebar_top(gray)
@@ -212,6 +212,19 @@ class ParticleAnalyzer:
                     continue
                 kept.append(p)
             particles = kept
+
+        if measure_shell:
+            blur3 = cv2.GaussianBlur(analysis_region, (3, 3), 0)
+            sgx = cv2.Sobel(blur3, cv2.CV_32F, 1, 0, ksize=3)
+            sgy = cv2.Sobel(blur3, cv2.CV_32F, 0, 1, ksize=3)
+            rh, rw = analysis_region.shape
+            for p in particles:
+                inner = None
+                if not p.get("excluded"):
+                    inner = self._measure_shell(sgx, sgy, blur3,
+                                                p["center_x"], p["center_y"],
+                                                p["radius_px"], rw, rh)
+                self._record_shell(p, inner)
 
         if detect_cores:
             for p in particles:
@@ -532,6 +545,95 @@ class ParticleAnalyzer:
                      or self._has_rim_between(blurred, cx, cy, strong[2], outer[2]))):
             return outer, r_outer, s_outer, outer_thresh
         return strong, r_strong, s_strong, score_thresh
+
+    def _record_shell(self, particle, inner_r):
+        """Attach shell thickness and void fraction to a particle record."""
+        scale = self.nm_per_px or 1.0
+        outer_r = particle["radius_px"]
+        if inner_r is None or outer_r <= 0:
+            particle["inner_radius_px"] = None
+            particle["inner_diameter"] = None
+            particle["shell_thickness"] = None
+            particle["porosity"] = None
+            return
+        particle["inner_radius_px"] = inner_r
+        particle["inner_diameter"] = inner_r * 2 * scale
+        particle["shell_thickness"] = (outer_r - inner_r) * scale
+        # Void fraction of a spherical shell goes as the cube of the radii.
+        particle["porosity"] = float((inner_r / outer_r) ** 3)
+
+    def _measure_shell(self, gx, gy, blurred, cx, cy, outer_r, w, h, n_angles=96):
+        """Find the cavity wall inside a particle of radius ``outer_r``.
+
+        Returns the inner radius, or None when no coherent inner boundary is
+        there - a solid particle has none, and reporting a shell for one would
+        be worse than reporting nothing. Circular gradients alone are not
+        enough for that: a solid particle's own texture produces them, so the
+        cavity has to be visibly a different brightness from the shell around
+        it before a shell is reported.
+        """
+        lo = max(2.0, outer_r * 0.25)
+        hi = outer_r * 0.92
+        if hi - lo < 3:
+            return None
+
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        radii = np.arange(lo, hi, 0.5)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        xs = (cx + np.outer(cos_a, radii)).astype(int)
+        ys = (cy + np.outer(sin_a, radii)).astype(int)
+        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        rows = np.clip(ys, 0, h - 1)
+        cols = np.clip(xs, 0, w - 1)
+        radial = gx[rows, cols] * cos_a[:, None] + gy[rows, cols] * sin_a[:, None]
+        strength = np.where(valid, np.abs(radial), 0.0)
+
+        peak = strength.max(axis=1)
+        best = np.argmax(strength, axis=1)
+        usable = (peak > 0) & (valid.sum(axis=1) >= len(radii) * 0.6)
+        r_ang = np.where(usable, radii[best], np.nan)
+        s_ang = np.where(usable, peak, 0.0)
+
+        live = s_ang[s_ang > 0]
+        if live.size < n_angles * 0.5:
+            return None
+        # Threshold at the 30th percentile so the coverage figure below is a
+        # real test rather than an artefact of where the cut was made.
+        fit = self._robust_circle_fit(cx, cy, angles, r_ang, s_ang,
+                                      np.percentile(live, 30))
+        if fit is None:
+            return None
+        _, _, inner_r, coverage, rms, _ = fit
+        if coverage < 0.6 or rms > 0.12:
+            return None
+        if not (lo <= inner_r <= hi):
+            return None
+
+        def ring_level(r_from, r_to):
+            samples = []
+            for frac in (0.3, 0.5, 0.7):
+                r = r_from + (r_to - r_from) * frac
+                px = (cx + r * cos_a).astype(int)
+                py = (cy + r * sin_a).astype(int)
+                v = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+                if v.sum() < n_angles * 0.5:
+                    return None
+                samples.append(np.median(blurred[py[v], px[v]]))
+            return float(np.median(samples))
+
+        cavity = ring_level(0.15 * inner_r, 0.8 * inner_r)
+        shell = ring_level(inner_r, outer_r)
+        outside = ring_level(outer_r * 1.08, outer_r * 1.3)
+        if cavity is None or shell is None:
+            return None
+        # The cavity has to stand out from the shell about as clearly as the
+        # particle stands out from its surroundings. A solid particle's own
+        # texture clears a fixed threshold often enough to be useless.
+        inner_contrast = abs(cavity - shell)
+        edge_contrast = abs(shell - outside) if outside is not None else inner_contrast
+        if inner_contrast < 25 or inner_contrast < 0.55 * edge_contrast:
+            return None
+        return float(inner_r)
 
     @staticmethod
     def _trace_boundary(gx, gy, cx, cy, r0, w, h, n_angles=96):
@@ -1015,6 +1117,14 @@ class ParticleAnalyzer:
             "excluded": excluded_count,
             "approx": sum(1 for p in particles if p.get("approx")),
         }
+        shelled = [p for p in particles if p.get("shell_thickness") is not None]
+        if shelled:
+            stats["shell_count"] = len(shelled)
+            stats["shell_mean"] = float(np.mean([p["shell_thickness"] for p in shelled]))
+            stats["shell_std"] = float(np.std([p["shell_thickness"] for p in shelled]))
+            stats["porosity_mean"] = float(np.mean([p["porosity"] for p in shelled]))
+            stats["inner_mean"] = float(np.mean([p["inner_diameter"] for p in shelled]))
+
         if particles and "has_core" in particles[0]:
             core_count = sum(1 for p in particles if p["has_core"])
             stats["core_count"] = core_count

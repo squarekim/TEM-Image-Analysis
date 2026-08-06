@@ -278,6 +278,13 @@ class MainWindow(QMainWindow):
             "일반 입자에서도 손해가 없으므로 켜 두어도 됩니다.")
         param_form.addRow(self.chk_hollow)
 
+        self.chk_shell = QCheckBox("쉘 두께 / 공극률 측정")
+        self.chk_shell.setChecked(False)
+        self.chk_shell.setToolTip(
+            "중공 입자의 안쪽 공동 경계를 찾아 쉘 두께와 공극률을 계산합니다.\n"
+            "공동이 뚜렷하지 않은 입자는 측정하지 않습니다.")
+        param_form.addRow(self.chk_shell)
+
         self.chk_core = QCheckBox("코어 검출 (Yolk-shell)")
         self.chk_core.setChecked(False)
         self.chk_core.setToolTip("중공 입자 내부의 코어 입자를 감지하고 보유 비율을 계산")
@@ -297,6 +304,8 @@ class MainWindow(QMainWindow):
         self.lbl_d50 = QLabel("-")
         self.lbl_d90 = QLabel("-")
         self.lbl_core = QLabel("-")
+        self.lbl_shell = QLabel("-")
+        self.lbl_porosity = QLabel("-")
         stats_form.addRow("입자 수:", self.lbl_count)
         stats_form.addRow("평균 직경:", self.lbl_mean)
         stats_form.addRow("표준편차:", self.lbl_std)
@@ -306,6 +315,8 @@ class MainWindow(QMainWindow):
         stats_form.addRow("D50:", self.lbl_d50)
         stats_form.addRow("D90:", self.lbl_d90)
         stats_form.addRow("코어 보유율:", self.lbl_core)
+        stats_form.addRow("쉘 두께:", self.lbl_shell)
+        stats_form.addRow("공극률:", self.lbl_porosity)
         stats_group.setLayout(stats_form)
         right_layout.addWidget(stats_group)
 
@@ -428,7 +439,8 @@ class MainWindow(QMainWindow):
                 circularity_thresh=self.spin_circularity.value(),
                 use_watershed=self.chk_watershed.isChecked(),
                 hollow=self.chk_hollow.isChecked(),
-                detect_cores=self.chk_core.isChecked(),
+                    detect_cores=self.chk_core.isChecked(),
+                measure_shell=self.chk_shell.isChecked(),
             )
         finally:
             QApplication.restoreOverrideCursor()
@@ -503,6 +515,9 @@ class MainWindow(QMainWindow):
             if excluded:
                 continue
             num += 1
+            if p.get("inner_radius_px"):
+                cv2.circle(display, (cx, cy), int(p["inner_radius_px"] * scale),
+                           (255, 200, 0), max(1, thickness - 1))
             if p.get("has_core"):
                 cv2.drawMarker(display, (cx, cy), (0, 165, 255),
                                cv2.MARKER_CROSS, max(10, r // 3), thickness)
@@ -620,6 +635,14 @@ class MainWindow(QMainWindow):
                 f"{stats['core_count']}/{stats['count']} ({stats['core_ratio']*100:.1f}%)")
         else:
             self.lbl_core.setText("-")
+        if "shell_mean" in stats:
+            self.lbl_shell.setText(
+                f"{stats['shell_mean']:.2f} ± {stats['shell_std']:.2f} {u}"
+                f"  ({stats['shell_count']}개)")
+            self.lbl_porosity.setText(f"{stats['porosity_mean'] * 100:.1f} %")
+        else:
+            self.lbl_shell.setText("-")
+            self.lbl_porosity.setText("-")
 
     @staticmethod
     def _numeric_item(value, text):
@@ -633,12 +656,14 @@ class MainWindow(QMainWindow):
         has_core_col = bool(particles) and "has_core" in particles[0]
         # Pixel diameter is shown next to the calibrated value so a mismatch
         # with hand measurements can be pinned on the scale or on the sizing.
+        has_shell_col = any(p.get("shell_thickness") is not None for p in particles)
+        headers = ["#", "직경", "직경(px)", "면적"]
+        if has_shell_col:
+            headers += ["쉘 두께", "공극률(%)"]
         if has_core_col:
-            self.table.setColumnCount(5)
-            self.table.setHorizontalHeaderLabels(["#", "직경", "직경(px)", "면적", "코어"])
-        else:
-            self.table.setColumnCount(4)
-            self.table.setHorizontalHeaderLabels(["#", "직경", "직경(px)", "면적"])
+            headers += ["코어"]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(particles))
         u = self.unit
@@ -648,8 +673,18 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 1, self._numeric_item(p["diameter"], f"{p['diameter']:.2f} {u}"))
             self.table.setItem(i, 2, self._numeric_item(p["radius_px"] * 2, "px"))
             self.table.setItem(i, 3, self._numeric_item(p["area"], f"{u}²"))
+            col = 4
+            if has_shell_col:
+                if p.get("shell_thickness") is not None:
+                    self.table.setItem(i, col, self._numeric_item(p["shell_thickness"], u))
+                    self.table.setItem(i, col + 1,
+                                       self._numeric_item(p["porosity"] * 100, "%"))
+                else:
+                    self.table.setItem(i, col, QTableWidgetItem("-"))
+                    self.table.setItem(i, col + 1, QTableWidgetItem("-"))
+                col += 2
             if has_core_col:
-                self.table.setItem(i, 4, QTableWidgetItem("유" if p["has_core"] else "무"))
+                self.table.setItem(i, col, QTableWidgetItem("유" if p["has_core"] else "무"))
         self.table.setSortingEnabled(True)
 
     def _update_histogram(self):
@@ -677,6 +712,9 @@ class MainWindow(QMainWindow):
         headers = ["#", f"Diameter ({u})", "Diameter (px)", f"Area ({u}²)",
                    "Center X (px)", "Center Y (px)"]
         headers += ["Approx"]
+        has_shell = any(p.get("shell_thickness") is not None for p in particles)
+        if has_shell:
+            headers += [f"Inner Diameter ({u})", f"Shell Thickness ({u})", "Porosity"]
         if has_core:
             headers += ["Has Core"]
         ws_data.append(headers)
@@ -684,6 +722,9 @@ class MainWindow(QMainWindow):
             row = [i + 1, p["diameter"], p["radius_px"] * 2, p["area"],
                    p["center_x"], p["center_y"]]
             row += ["Y" if p.get("approx") else "N"]
+            if has_shell:
+                row += [p.get("inner_diameter"), p.get("shell_thickness"),
+                        p.get("porosity")]
             if has_core:
                 row += ["Y" if p["has_core"] else "N"]
             ws_data.append(row)
@@ -699,6 +740,12 @@ class MainWindow(QMainWindow):
         ws_stats.append(["D10", stats["d10"], u])
         ws_stats.append(["D50", stats["d50"], u])
         ws_stats.append(["D90", stats["d90"], u])
+        if "shell_mean" in stats:
+            ws_stats.append(["Shell Count", stats["shell_count"], ""])
+            ws_stats.append(["Mean Shell Thickness", stats["shell_mean"], u])
+            ws_stats.append(["Shell Thickness Std", stats["shell_std"], u])
+            ws_stats.append(["Mean Inner Diameter", stats["inner_mean"], u])
+            ws_stats.append(["Mean Porosity", stats["porosity_mean"], ""])
         if "core_ratio" in stats:
             ws_stats.append(["Core Count", stats["core_count"], ""])
             ws_stats.append(["Core Ratio", stats["core_ratio"], ""])
