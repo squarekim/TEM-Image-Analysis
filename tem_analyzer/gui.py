@@ -1,5 +1,6 @@
-import sys
+import math
 import os
+import sys
 
 from . import qt_bootstrap
 
@@ -13,7 +14,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox, QSplitter,
     QMessageBox, QHeaderView, QComboBox, QCheckBox,
 )
-from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtCore import Qt, QPoint, QRectF
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -41,127 +42,137 @@ class ImageLabel(QLabel):
         self._zoom = 1.0          # 1.0 = fit the whole image in the widget
         self._pan = QPoint(0, 0)  # offset from centred, in widget pixels
         self._pan_from = None
-        self._press_pos = None
         self._panned = False
+        # Pixmap pixels per original-image pixel, so callbacks can report
+        # coordinates in the only unit the measurements are in.
+        self.source_scale = 1.0
 
     MAX_ZOOM = 16.0
 
-    def set_image(self, pixmap, reset_view=True):
-        """Show a pixmap. Redrawing results keeps the current view."""
-        same_size = (self._pixmap is not None
-                     and self._pixmap.size() == pixmap.size())
+    def set_image(self, pixmap, reset_view=True, source_scale=1.0):
         self._pixmap = pixmap
+        self.source_scale = source_scale or 1.0
         self._drag_start = self._drag_end = None
-        if reset_view or not same_size:
+        if reset_view:
             self._zoom = 1.0
             self._pan = QPoint(0, 0)
-        self._update_display()
+        self._apply_view()
 
     def _fit_size(self):
         """Size the image would take scaled to fit the widget."""
         return self._pixmap.size().scaled(self.size(), Qt.KeepAspectRatio)
 
-    def _scaled(self):
-        fit = self._fit_size()
-        target = fit * self._zoom
-        # Smooth scaling averages neighbouring pixels away; past ~1.5x that
-        # blurs exactly the grain and edges one zooms in to look at.
-        mode = (Qt.FastTransformation
-                if target.width() > self._pixmap.width() * 1.5
-                else Qt.SmoothTransformation)
-        return self._pixmap.scaled(target, Qt.KeepAspectRatio, mode)
+    def _scaled_size(self):
+        """On-screen size of the whole image at the current zoom.
+
+        Pure arithmetic: the geometry is needed on every mouse move, and
+        actually resampling the pixmap to ask how big it is costs seconds and
+        hundreds of megabytes once zoomed in on a 2048px image.
+        """
+        return self._fit_size() * self._zoom
 
     def zoom_percent(self):
         if not self._pixmap or self._pixmap.width() == 0:
             return 100.0
-        return self._fit_size().width() * self._zoom / self._pixmap.width() * 100.0
+        return self._scaled_size().width() / self._pixmap.width() * 100.0
+
+    def _apply_view(self):
+        """Single epilogue for anything that changes what is on screen."""
+        if self._pixmap:
+            self._clamp_pan()
+        self.update()
+        if self.zoom_callback:
+            self.zoom_callback(self.zoom_percent())
 
     def set_zoom(self, zoom, anchor=None):
         """Zoom about `anchor` (widget coords), keeping that point in place."""
         if not self._pixmap:
             return
-        zoom = float(np.clip(zoom, 1.0, self.MAX_ZOOM))
+        zoom = min(max(float(zoom), 1.0), self.MAX_ZOOM)
         if abs(zoom - self._zoom) < 1e-6:
             return
         if anchor is None:
             anchor = QPoint(self.width() // 2, self.height() // 2)
 
-        before = self._offset(self._scaled())
+        before = self._offset()
         ratio = zoom / self._zoom
         self._zoom = zoom
         # The image point under the anchor is (anchor - offset) / scale; hold
         # it fixed by moving the pan so that quantity is unchanged.
-        after_centre = self._centre_offset(self._scaled())
         rel = anchor - before
-        self._pan = anchor - after_centre - QPoint(int(rel.x() * ratio),
-                                                   int(rel.y() * ratio))
-        self._clamp_pan()
-        self._update_display()
-        if self.zoom_callback:
-            self.zoom_callback(self.zoom_percent())
+        self._pan = anchor - self._centre_offset() - QPoint(int(rel.x() * ratio),
+                                                            int(rel.y() * ratio))
+        self._apply_view()
 
-    def step_zoom(self, factor, anchor=None):
-        self.set_zoom(self._zoom * factor, anchor)
+    def step_zoom(self, factor):
+        self.set_zoom(self._zoom * factor)
 
     def reset_view(self):
         self._zoom = 1.0
         self._pan = QPoint(0, 0)
-        self._update_display()
-        if self.zoom_callback:
-            self.zoom_callback(self.zoom_percent())
+        self._apply_view()
 
     def _clamp_pan(self):
         """Keep the image covering the widget; centre it on the axes it can't."""
-        scaled = self._scaled()
-        for axis, span, extent in (("x", self.width(), scaled.width()),
-                                   ("y", self.height(), scaled.height())):
-            slack = max(0, (extent - span) // 2)
-            value = self._pan.x() if axis == "x" else self._pan.y()
-            value = int(np.clip(value, -slack, slack))
-            if axis == "x":
-                self._pan.setX(value)
-            else:
-                self._pan.setY(value)
+        scaled = self._scaled_size()
+        slack_x = max(0, (scaled.width() - self.width()) // 2)
+        slack_y = max(0, (scaled.height() - self.height()) // 2)
+        self._pan = QPoint(min(max(self._pan.x(), -slack_x), slack_x),
+                           min(max(self._pan.y(), -slack_y), slack_y))
 
-    def _update_display(self):
+    def paintEvent(self, event):
+        super().paintEvent(event)  # stylesheet background and border
         if not self._pixmap:
             return
-        scaled = self._scaled()
-        # Paint a widget-sized canvas rather than handing the scaled pixmap to
-        # QLabel: once zoomed in, the image is larger than the widget and only
-        # our own offset knows which part of it should be visible.
-        canvas = QPixmap(self.size())
-        canvas.fill(QColor("#222222"))
-        painter = QPainter(canvas)
-        painter.drawPixmap(self._offset(scaled), scaled)
+        painter = QPainter(self)
+        painter.setClipRect(self.contentsRect())
+
+        scaled = self._scaled_size()
+        off = self._offset()
+        target = QRectF(off.x(), off.y(), scaled.width(), scaled.height())
+        visible = target.intersected(QRectF(self.rect()))
+        if not visible.isEmpty():
+            # Draw only the part of the image the widget can show. Scaling the
+            # whole pixmap instead would cost time and memory proportional to
+            # the zoom (655 MB at 16x on a 2048px image) to throw nearly all
+            # of it away.
+            fx = self._pixmap.width() / target.width()
+            fy = self._pixmap.height() / target.height()
+            source = QRectF((visible.x() - target.x()) * fx,
+                            (visible.y() - target.y()) * fy,
+                            visible.width() * fx, visible.height() * fy)
+            # Smoothing averages neighbouring pixels away; past ~1.5x that
+            # blurs exactly the grain and edges one zooms in to look at.
+            painter.setRenderHint(QPainter.SmoothPixmapTransform,
+                                  target.width() <= self._pixmap.width() * 1.5)
+            painter.drawPixmap(visible, self._pixmap, source)
+
         if self._drag_start and self._drag_end:
             painter.setPen(QPen(QColor(255, 60, 60), 2))
             painter.drawLine(self._drag_start, self._drag_end)
             for end in (self._drag_start, self._drag_end):
                 painter.drawLine(end.x(), end.y() - 6, end.x(), end.y() + 6)
-        painter.end()
-        super().setPixmap(canvas)
 
-    def _centre_offset(self, scaled):
+    def _centre_offset(self):
+        scaled = self._scaled_size()
         return QPoint(int((self.width() - scaled.width()) / 2),
                       int((self.height() - scaled.height()) / 2))
 
-    def _offset(self, scaled):
-        return self._centre_offset(scaled) + self._pan
+    def _offset(self):
+        return self._centre_offset() + self._pan
 
     def _to_image_coords(self, pos):
-        scaled = self._scaled()
-        off = self._offset(scaled)
+        """Widget point -> original-image pixels, or None if outside the image."""
+        scaled = self._scaled_size()
+        off = self._offset()
         px, py = pos.x() - off.x(), pos.y() - off.y()
         if not (0 <= px < scaled.width() and 0 <= py < scaled.height()):
             return None
-        return (px * self._pixmap.width() / scaled.width(),
-                py * self._pixmap.height() / scaled.height())
+        return (px * self._pixmap.width() / scaled.width() / self.source_scale,
+                py * self._pixmap.height() / scaled.height() / self.source_scale)
 
     def resizeEvent(self, event):
-        if self._pixmap:
-            self._clamp_pan()
-        self._update_display()
+        self._apply_view()
         super().resizeEvent(event)
 
     def wheelEvent(self, event):
@@ -197,12 +208,11 @@ class ImageLabel(QLabel):
     def mousePressEvent(self, event):
         if not self._pixmap:
             return super().mousePressEvent(event)
-        self._press_pos = event.pos()
         self._panned = False
         if self.measure_mode and event.button() == Qt.LeftButton:
             self._drag_start = event.pos()
             self._drag_end = event.pos()
-            self._update_display()
+            self.update()
         else:
             self._pan_from = (event.pos(), QPoint(self._pan))
         super().mousePressEvent(event)
@@ -210,7 +220,7 @@ class ImageLabel(QLabel):
     def mouseMoveEvent(self, event):
         if self.measure_mode and self._drag_start:
             self._drag_end = self._constrain(event.pos(), event.modifiers())
-            self._update_display()
+            self.update()
             if self.measuring_callback:
                 start = self._to_image_coords(self._drag_start)
                 end = self._to_image_coords(self._drag_end)
@@ -226,13 +236,13 @@ class ImageLabel(QLabel):
             if self._panned:
                 self._pan = base + delta
                 self._clamp_pan()
-                self._update_display()
+                self.update()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self.measure_mode and self._drag_start:
             self._drag_end = self._constrain(event.pos(), event.modifiers())
-            self._update_display()
+            self.update()
             start = self._to_image_coords(self._drag_start)
             end = self._to_image_coords(self._drag_end)
             if start and end and self.measure_callback:
@@ -289,6 +299,7 @@ class MainWindow(QMainWindow):
         self.nm_per_px = None
         self.scale_text = None
         self.unit = "nm"
+        self._measuring_shown = None
 
         self._build_ui()
         self.statusBar().showMessage("이미지를 로드해주세요.")
@@ -506,6 +517,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_measure_mode(self, checked):
         self.image_label.measure_mode = checked
+        self._measuring_shown = None
         self.image_label.setCursor(Qt.CrossCursor if checked else Qt.ArrowCursor)
         if checked:
             self.statusBar().showMessage(
@@ -517,18 +529,18 @@ class MainWindow(QMainWindow):
         self.lbl_zoom.setText(f"{percent:.0f}%")
 
     def _on_scalebar_measuring(self, start, end, locked):
-        scale = getattr(self, "_display_scale", 1.0) or 1.0
-        dx = (end[0] - start[0]) / scale
-        dy = (end[1] - start[1]) / scale
+        length = math.hypot(end[0] - start[0], end[1] - start[1])
+        # Mouse-move fires far faster than anyone can read; only redraw the
+        # status bar when the number it shows actually changes.
+        if round(length, 1) == self._measuring_shown:
+            return
+        self._measuring_shown = round(length, 1)
         hint = "축 고정 (Shift)" if locked else "Shift를 누르면 수평/수직으로 고정"
-        self.statusBar().showMessage(
-            f"드래그 중: {np.hypot(dx, dy):.1f} px   —   {hint}")
+        self.statusBar().showMessage(f"드래그 중: {length:.1f} px   —   {hint}")
 
     def _on_scalebar_measured(self, start, end):
-        scale = getattr(self, "_display_scale", 1.0) or 1.0
-        p0 = (start[0] / scale, start[1] / scale)
-        p1 = (end[0] / scale, end[1] / scale)
-        length = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+        p0, p1 = start, end
+        length = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
         if length < 2:
             return
 
@@ -739,11 +751,9 @@ class MainWindow(QMainWindow):
                 cv2.polylines(display, [np.array(seg, np.int32).reshape(-1, 1, 2)],
                               False, color, thickness)
 
-    def _on_image_click(self, ix, iy):
+    def _on_image_click(self, ox, oy):
         if not self.particles or "has_core" not in (self.particles[0] if self.particles else {}):
             return
-        scale = getattr(self, "_display_scale", 1.0) or 1.0
-        ox, oy = ix / scale, iy / scale
         best = None
         best_d = None
         for p in self.particles:
@@ -778,12 +788,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"결과 이미지 저장 완료: {path}")
 
     def _display_image(self, cv_img, reset_view=False):
-        # The result view is rendered at an integer upscale, so remember the
-        # factor that maps what is on screen back to original image pixels.
+        # The result view is rendered at an integer upscale; the view maps its
+        # own coordinates back to original image pixels through this factor.
         if self.original_image is not None:
-            self._display_scale = cv_img.shape[1] / self.original_image.shape[1]
+            source_scale = cv_img.shape[1] / self.original_image.shape[1]
         else:
-            self._display_scale = 1.0
+            source_scale = 1.0
         if len(cv_img.shape) == 2:
             h, w = cv_img.shape
             qimg = QImage(cv_img.data, w, h, w, QImage.Format_Grayscale8)
@@ -791,8 +801,8 @@ class MainWindow(QMainWindow):
             rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
             qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        self.image_label.set_image(QPixmap.fromImage(qimg), reset_view=reset_view)
-        self.lbl_zoom.setText(f"{self.image_label.zoom_percent():.0f}%")
+        self.image_label.set_image(QPixmap.fromImage(qimg), reset_view=reset_view,
+                                   source_scale=source_scale)
 
     def _update_stats(self, stats):
         if not stats:
