@@ -22,11 +22,38 @@ from tem_analyzer.analyzer import ParticleAnalyzer, load_image  # noqa: E402
 
 
 def main():
-    if len(sys.argv) < 4:
+    args = sys.argv[1:]
+    if len(args) < 3:
         print(__doc__)
         return 1
 
-    path, cx, cy = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+    # TEM files routinely have spaces in their names, and an unquoted path
+    # arrives split across several arguments. The coordinates are always the
+    # last two, so everything before them is the path.
+    try:
+        cx, cy = int(args[-2]), int(args[-1])
+    except ValueError:
+        print("마지막 두 값은 좌표(숫자)여야 합니다. 예:")
+        print('   py tests\\profile_tool.py "내 이미지.jpg" 886 565')
+        return 1
+    path = " ".join(args[:-2])
+
+    if os.path.isdir(path):
+        print(f"폴더를 지정하셨습니다: {path}")
+        print("이미지 파일까지 지정해야 합니다. 예: 위 경로 뒤에 \\사진.jpg")
+        return 1
+    if not os.path.exists(path):
+        print(f"파일을 찾을 수 없습니다: {path}")
+        folder = os.path.dirname(path) or "."
+        if os.path.isdir(folder):
+            names = [f for f in os.listdir(folder)
+                     if f.lower().endswith((".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"))]
+            if names:
+                print("\n이 폴더의 이미지 파일:")
+                for n in names[:15]:
+                    print(f'   "{n}"')
+        return 1
+
     image = load_image(path)
     if image is None:
         print(f"이미지를 읽을 수 없습니다: {path}")
