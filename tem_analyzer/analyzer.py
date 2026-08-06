@@ -260,17 +260,13 @@ class ParticleAnalyzer:
         h, w = gray.shape
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.5)
         min_r = max(5, int(np.sqrt(min_area_px / np.pi)))
-        max_r = min(h, w) // 4
+        max_r = max(min_r + 1, min(h, w) // 3)
 
-        est = None
-        for param2 in [45, 40, 35, 30]:
-            circles = cv2.HoughCircles(
-                blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=max(10, min_r),
-                param1=80, param2=param2, minRadius=min_r, maxRadius=max_r
-            )
-            if circles is not None and len(circles[0]) >= 5:
-                est = self._radius_mode(circles[0][:, 2])
-                break
+        blur3 = cv2.GaussianBlur(gray, (3, 3), 0)
+        gx = cv2.Sobel(blur3, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(blur3, cv2.CV_32F, 0, 1, ksize=3)
+
+        est = self._estimate_radius(blurred, gx, gy, min_r, max_r, w, h)
         if est is None:
             return []
 
@@ -291,6 +287,7 @@ class ParticleAnalyzer:
         if best is None:
             return []
 
+        polarity = self._contrast_polarity(blurred, best)
         seeds = [(int(cx), int(cy), int(r)) for cx, cy, r in best]
         med = float(np.median([s[2] for s in seeds]))
 
@@ -303,14 +300,11 @@ class ParticleAnalyzer:
                     continue
             expanded.append((cx, cy, r))
 
-        blur3 = cv2.GaussianBlur(gray, (3, 3), 0)
-        gx = cv2.Sobel(blur3, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(blur3, cv2.CV_32F, 0, 1, ksize=3)
-
         traces = []
         all_scores = []
         for cx, cy, r in expanded:
-            trace = self._trace_boundary(gx, gy, cx, cy, r, w, h)
+            trace = self._trace_boundary(gx, gy, cx, cy, r, w, h,
+                                         polarity=polarity)
             traces.append(trace)
             all_scores.extend(trace[2][trace[2] > 0])
         if not all_scores:
@@ -339,7 +333,15 @@ class ParticleAnalyzer:
                                   cy + np.where(np.isnan(r_ang), 0, r_ang) * np.sin(angles) - uy)
             spread = self._smoothed_spread(r_from_fit, good)
 
-            usable = center_inside and ring_inside >= 0.5 and spread <= 1.6
+            # A real particle stands out from what surrounds it, in the
+            # direction the image's polarity says. A circle drawn over
+            # background or across a gap fails this even when its arc happens
+            # to fit, which is how noise survives the geometric tests.
+            contrast = self._edge_contrast(blurred, ux, uy, rr, w, h)
+            has_body = contrast is not None and polarity * contrast > 3.0
+
+            usable = (center_inside and ring_inside >= 0.5 and spread <= 1.6
+                      and has_body)
             if usable and coverage >= 0.5 and rms <= 0.10:
                 p["approx"] = False
                 p["excluded"] = False
@@ -369,7 +371,113 @@ class ParticleAnalyzer:
         return particles
 
     @staticmethod
-    def _trace_boundary(gx, gy, cx, cy, r0, w, h, n_angles=96):
+    def _edge_contrast(blurred, cx, cy, r, w, h):
+        """Outside-minus-inside brightness across a circle's boundary.
+
+        Positive means the circle is darker than what surrounds it. Returns
+        None when too much of either ring falls outside the frame.
+        """
+        angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        samples = []
+        for frac in (0.85, 1.15):
+            xs = (cx + r * frac * cos_a).astype(int)
+            ys = (cy + r * frac * sin_a).astype(int)
+            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            if v.sum() < len(angles) * 0.5:
+                return None
+            samples.append(float(np.median(blurred[ys[v], xs[v]])))
+        return samples[1] - samples[0]
+
+    @staticmethod
+    def _contrast_polarity(blurred, circles):
+        """+1 when particles are darker than their surroundings, else -1.
+
+        Read straight off the candidate circles by comparing a ring just inside
+        the boundary with one just outside. Hough locates circles from gradient
+        magnitude alone, so its output is available before the edge direction
+        has to be decided. Sampling near the boundary rather than at the centre
+        keeps hollow particles - whose cavity is bright but whose shell is not -
+        on the right side of the comparison.
+        """
+        h, w = blurred.shape
+        angles = np.linspace(0, 2 * np.pi, 32, endpoint=False)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        inside, outside = [], []
+        for cx, cy, r in circles[:24]:
+            for frac, bucket in ((0.85, inside), (1.15, outside)):
+                xs = (cx + r * frac * cos_a).astype(int)
+                ys = (cy + r * frac * sin_a).astype(int)
+                v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+                if v.sum() >= len(angles) * 0.5:
+                    bucket.append(np.median(blurred[ys[v], xs[v]]))
+        if not inside or not outside:
+            return 1.0
+        return 1.0 if np.median(inside) < np.median(outside) else -1.0
+
+    def _estimate_radius(self, blurred, gx, gy, min_r, max_r, w, h):
+        """Pick the particle size scale, judging candidates by their edges.
+
+        Taking the modal radius of one wide Hough sweep lets image grain decide
+        the answer: a noisy micrograph of a few large particles yields hundreds
+        of circles the size of the speckle, swamping the handful of real ones.
+        Instead each octave of radii is sampled separately and its circles are
+        traced; a band only scores for circles whose boundary actually looks
+        like a particle edge, which grain cannot fake.
+        """
+        best_score, best_est = 0.0, None
+        lo = min_r
+        while lo < max_r:
+            hi = min(max_r, lo * 2)
+            circles = None
+            for param2 in [45, 40, 35, 30]:
+                found = cv2.HoughCircles(
+                    blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=max(10, lo),
+                    param1=80, param2=param2, minRadius=int(lo), maxRadius=int(hi)
+                )
+                if found is not None and len(found[0]) >= 3:
+                    circles = found[0]
+                    break
+            lo = hi
+            if circles is None:
+                continue
+
+            sample = circles[:16]
+            # Polarity is not known yet, so score the band under both and keep
+            # whichever reading makes the edges look more like particles.
+            for polarity in (1.0, -1.0):
+                traces = [self._trace_boundary(gx, gy, int(cx), int(cy), int(r),
+                                               w, h, polarity=polarity)
+                          for cx, cy, r in sample]
+                scores = [s for _, _, s_ang in traces for s in s_ang[s_ang > 0]]
+                if not scores:
+                    continue
+                thresh = np.percentile(scores, 30)
+                passed = 0
+                for (cx, cy, r), (angles, r_ang, s_ang) in zip(sample, traces):
+                    fit = self._robust_circle_fit(int(cx), int(cy), angles, r_ang,
+                                                  s_ang, thresh, r0=int(r))
+                    if fit and fit[3] >= 0.5 and fit[4] <= 0.10:
+                        passed += 1
+
+                # Scale the validated fraction by the population so a band with
+                # a few solid circles beats one with many unconvincing ones.
+                score = (passed / len(sample)) * len(circles)
+                if score > best_score:
+                    best_score = score
+                    best_est = self._radius_mode(circles[:, 2])
+        return best_est
+
+    @staticmethod
+    def _trace_boundary(gx, gy, cx, cy, r0, w, h, n_angles=96, polarity=1.0):
+        """Follow the particle edge outward along rays from (cx, cy).
+
+        ``polarity`` is +1 when particles are darker than their surroundings -
+        the usual mass-thickness contrast - and -1 when they are brighter, as
+        in images where particles are separated by dark boundaries. With the
+        wrong sign the search runs past the true edge looking for a rise in
+        brightness that only comes at the next particle.
+        """
         angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
         radii = np.arange(max(2, r0 * 0.55), r0 * 1.5, 0.5)
         cos_a, sin_a = np.cos(angles), np.sin(angles)
@@ -380,7 +488,8 @@ class ParticleAnalyzer:
 
         rows = np.clip(ys, 0, h - 1)
         cols = np.clip(xs, 0, w - 1)
-        outward = (gx[rows, cols] * cos_a[:, None] + gy[rows, cols] * sin_a[:, None])
+        outward = polarity * (gx[rows, cols] * cos_a[:, None]
+                              + gy[rows, cols] * sin_a[:, None])
         outward = np.where(valid, outward, -np.inf)
 
         best = np.argmax(outward, axis=1)
