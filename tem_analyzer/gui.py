@@ -313,6 +313,7 @@ class MainWindow(QMainWindow):
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["#", "직경", "면적"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSortingEnabled(True)
         right_layout.addWidget(self.table)
 
         splitter.addWidget(left)
@@ -447,10 +448,34 @@ class MainWindow(QMainWindow):
             msg += f" (근사 {n_approx}개 포함)"
         if n_exc:
             msg += f", 판별불가 {n_exc}개 제외"
+        n_overlap, _ = self._overlapping_pairs()
+        if n_overlap:
+            msg += f"  |  겹치는 검출 {n_overlap}쌍 (보라색) - 중복 여부 확인 필요"
         self.statusBar().showMessage(msg)
 
     def _valid_particles(self):
         return [p for p in self.particles if not p.get("excluded")]
+
+    def _overlapping_pairs(self):
+        """Valid detections that sit substantially on top of one another.
+
+        Two circles covering the same particle inflate the count without
+        looking obviously wrong in a crowded field, so they are called out
+        rather than left to be spotted by eye.
+        """
+        valid = self._valid_particles()
+        flagged = set()
+        pairs = 0
+        for i, p in enumerate(valid):
+            for j in range(i + 1, len(valid)):
+                q = valid[j]
+                d = np.hypot(p["center_x"] - q["center_x"],
+                             p["center_y"] - q["center_y"])
+                if d < 0.55 * (p["radius_px"] + q["radius_px"]):
+                    pairs += 1
+                    flagged.add(id(p))
+                    flagged.add(id(q))
+        return pairs, flagged
 
     def _draw_results(self):
         h, w = self.original_image.shape[:2]
@@ -489,7 +514,8 @@ class MainWindow(QMainWindow):
             cv2.putText(display, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
                         font_scale, (80, 255, 255), 1)
 
-        legend = [("OK", (0, 220, 0)), ("Approx", (0, 220, 220)), ("Excluded", (0, 0, 255))]
+        legend = [("OK", (0, 220, 0)), ("Approx", (0, 220, 220)),
+                  ("Overlap", (255, 0, 255)), ("Excluded", (0, 0, 255))]
         lx = 10
         for label, color in legend:
             cv2.rectangle(display, (lx, 10), (lx + 18, 28), color, -1)
@@ -595,6 +621,13 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_core.setText("-")
 
+    @staticmethod
+    def _numeric_item(value, text):
+        item = QTableWidgetItem()
+        item.setData(Qt.DisplayRole, float(f"{value:.2f}"))
+        item.setToolTip(text)
+        return item
+
     def _update_table(self):
         particles = self._valid_particles()
         has_core_col = bool(particles) and "has_core" in particles[0]
@@ -606,16 +639,18 @@ class MainWindow(QMainWindow):
         else:
             self.table.setColumnCount(4)
             self.table.setHorizontalHeaderLabels(["#", "직경", "직경(px)", "면적"])
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(len(particles))
         u = self.unit
         for i, p in enumerate(particles):
             num = str(i + 1) + (" (근사)" if p.get("approx") else "")
-            self.table.setItem(i, 0, QTableWidgetItem(num))
-            self.table.setItem(i, 1, QTableWidgetItem(f"{p['diameter']:.2f} {u}"))
-            self.table.setItem(i, 2, QTableWidgetItem(f"{p['radius_px'] * 2:.1f}"))
-            self.table.setItem(i, 3, QTableWidgetItem(f"{p['area']:.2f} {u}²"))
+            self.table.setItem(i, 0, self._numeric_item(i + 1, num))
+            self.table.setItem(i, 1, self._numeric_item(p["diameter"], f"{p['diameter']:.2f} {u}"))
+            self.table.setItem(i, 2, self._numeric_item(p["radius_px"] * 2, "px"))
+            self.table.setItem(i, 3, self._numeric_item(p["area"], f"{u}²"))
             if has_core_col:
                 self.table.setItem(i, 4, QTableWidgetItem("유" if p["has_core"] else "무"))
+        self.table.setSortingEnabled(True)
 
     def _update_histogram(self):
         diameters = [p["diameter"] for p in self._valid_particles()]
