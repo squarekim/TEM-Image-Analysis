@@ -262,23 +262,27 @@ class ParticleAnalyzer:
         min_r = max(5, int(np.sqrt(min_area_px / np.pi)))
         max_r = max(min_r + 1, min(h, w) // 3)
 
-        blur3 = cv2.GaussianBlur(gray, (3, 3), 0)
-        gx = cv2.Sobel(blur3, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(blur3, cv2.CV_32F, 0, 1, ksize=3)
-
-        est = self._estimate_radius(blurred, gx, gy, min_r, max_r, w, h)
+        est = self._estimate_radius(gray, blurred, min_r, max_r, w, h)
         if est is None:
             return []
+        gx, gy = self._gradients(gray, est)
 
         min_r2 = max(min_r, int(est * 0.6))
         max_r2 = int(est * 1.5)
         min_dist2 = max(10, int(est * 1.4))
 
+        # Locating individual seeds uses a gentler blur than the band scan:
+        # enough to stop grain from dominating a wide radius sweep, but not so
+        # much that neighbours which touch are fused - the thing this stage
+        # exists to keep apart.
+        seed_img, seed_param1 = self._smooth_for_scale(gray, blurred, est,
+                                                       factor=0.025)
         best = None
         for param2 in [40, 35, 30, 25]:
             circles = cv2.HoughCircles(
-                blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_dist2,
-                param1=80, param2=param2, minRadius=min_r2, maxRadius=max_r2
+                seed_img, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_dist2,
+                param1=seed_param1, param2=param2,
+                minRadius=min_r2, maxRadius=max_r2
             )
             if circles is None:
                 continue
@@ -287,14 +291,14 @@ class ParticleAnalyzer:
         if best is None:
             return []
 
-        polarity = self._contrast_polarity(blurred, best)
+        polarity = self._contrast_polarity(seed_img, best)
         seeds = [(int(cx), int(cy), int(r)) for cx, cy, r in best]
         med = float(np.median([s[2] for s in seeds]))
 
         expanded = []
         for cx, cy, r in seeds:
             if r > med * 1.35:
-                subs = self._rehough_region(blurred, cx, cy, r, med, w, h)
+                subs = self._rehough_region(seed_img, cx, cy, r, med, w, h)
                 if subs and len(subs) >= 2:
                     expanded.extend(subs)
                     continue
@@ -415,25 +419,65 @@ class ParticleAnalyzer:
             return 1.0
         return 1.0 if np.median(inside) < np.median(outside) else -1.0
 
-    def _estimate_radius(self, blurred, gx, gy, min_r, max_r, w, h):
+    @staticmethod
+    def _smooth_for_scale(gray, default, radius, factor=0.04):
+        """Image and Canny threshold matched to the circle size being sought.
+
+        Searching every size on the same lightly blurred image makes the
+        large-radius passes grind through grain-scale edge points that cannot
+        belong to a circle that big. Blurring to the band's scale removes them,
+        but it also softens the real edges, so the gradient threshold has to
+        come down with it or nothing is detected at all. Small particles blur
+        to under a pixel and simply keep the default image.
+        """
+        sigma = radius * factor
+        if sigma <= 1.5:
+            return default, 80
+        sigma = min(sigma, 8.0)
+        return cv2.GaussianBlur(gray, (0, 0), sigma), max(20, int(80 * 1.5 / sigma))
+
+    @staticmethod
+    def _gradients(gray, radius):
+        """Edge gradients smoothed at the scale of the particles being traced.
+
+        A fixed small blur leaves image grain as the strongest local gradient,
+        so on a noisy micrograph of large particles each ray latches onto a
+        different speckle and the traced outline zigzags instead of following
+        the boundary. Smoothing proportionally keeps the particle edge - a
+        large-scale feature - while grain averages away.
+        """
+        sigma = float(np.clip(radius * 0.02, 0.8, 6.0))
+        smooth = cv2.GaussianBlur(gray, (0, 0), sigma)
+        return (cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3),
+                cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3))
+
+    def _estimate_radius(self, gray, blurred, min_r, max_r, w, h):
         """Pick the particle size scale, judging candidates by their edges.
 
         Taking the modal radius of one wide Hough sweep lets image grain decide
         the answer: a noisy micrograph of a few large particles yields hundreds
         of circles the size of the speckle, swamping the handful of real ones.
         Instead each octave of radii is sampled separately and its circles are
-        traced; a band only scores for circles whose boundary actually looks
-        like a particle edge, which grain cannot fake.
+        traced, each at the smoothing that scale calls for; a band only scores
+        for circles whose boundary actually looks like a particle edge, which
+        grain cannot fake.
         """
         best_score, best_est = 0.0, None
         lo = min_r
         while lo < max_r:
             hi = min(max_r, lo * 2)
+            mid = (lo + hi) / 2
+            # Smooth to the band's own scale before searching it. Feeding the
+            # raw image to every band makes the large-radius searches crawl
+            # through grain-scale edge points that cannot belong to a circle
+            # that big.
+            band_img, band_param1 = self._smooth_for_scale(gray, blurred, mid)
             circles = None
-            for param2 in [45, 40, 35, 30]:
+            for param2 in [40, 30]:
                 found = cv2.HoughCircles(
-                    blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=max(10, lo),
-                    param1=80, param2=param2, minRadius=int(lo), maxRadius=int(hi)
+                    band_img, cv2.HOUGH_GRADIENT, dp=1.2, minDist=max(10, lo),
+                    param1=band_param1, param2=param2,
+                    minRadius=int(lo), maxRadius=int(hi)
                 )
                 if found is not None and len(found[0]) >= 3:
                     circles = found[0]
@@ -442,6 +486,7 @@ class ParticleAnalyzer:
             if circles is None:
                 continue
 
+            gx, gy = self._gradients(gray, mid)
             sample = circles[:16]
             # Polarity is not known yet, so score the band under both and keep
             # whichever reading makes the edges look more like particles.
