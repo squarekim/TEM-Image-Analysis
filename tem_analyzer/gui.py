@@ -598,21 +598,24 @@ class MainWindow(QMainWindow):
     def _update_table(self):
         particles = self._valid_particles()
         has_core_col = bool(particles) and "has_core" in particles[0]
+        # Pixel diameter is shown next to the calibrated value so a mismatch
+        # with hand measurements can be pinned on the scale or on the sizing.
         if has_core_col:
-            self.table.setColumnCount(4)
-            self.table.setHorizontalHeaderLabels(["#", "직경", "면적", "코어"])
+            self.table.setColumnCount(5)
+            self.table.setHorizontalHeaderLabels(["#", "직경", "직경(px)", "면적", "코어"])
         else:
-            self.table.setColumnCount(3)
-            self.table.setHorizontalHeaderLabels(["#", "직경", "면적"])
+            self.table.setColumnCount(4)
+            self.table.setHorizontalHeaderLabels(["#", "직경", "직경(px)", "면적"])
         self.table.setRowCount(len(particles))
         u = self.unit
         for i, p in enumerate(particles):
             num = str(i + 1) + (" (근사)" if p.get("approx") else "")
             self.table.setItem(i, 0, QTableWidgetItem(num))
             self.table.setItem(i, 1, QTableWidgetItem(f"{p['diameter']:.2f} {u}"))
-            self.table.setItem(i, 2, QTableWidgetItem(f"{p['area']:.2f} {u}²"))
+            self.table.setItem(i, 2, QTableWidgetItem(f"{p['radius_px'] * 2:.1f}"))
+            self.table.setItem(i, 3, QTableWidgetItem(f"{p['area']:.2f} {u}²"))
             if has_core_col:
-                self.table.setItem(i, 3, QTableWidgetItem("유" if p["has_core"] else "무"))
+                self.table.setItem(i, 4, QTableWidgetItem("유" if p["has_core"] else "무"))
 
     def _update_histogram(self):
         diameters = [p["diameter"] for p in self._valid_particles()]
@@ -636,13 +639,15 @@ class MainWindow(QMainWindow):
         u = self.unit
         particles = self._valid_particles()
         has_core = bool(particles) and "has_core" in particles[0]
-        headers = ["#", f"Diameter ({u})", f"Area ({u}²)", "Center X (px)", "Center Y (px)"]
+        headers = ["#", f"Diameter ({u})", "Diameter (px)", f"Area ({u}²)",
+                   "Center X (px)", "Center Y (px)"]
         headers += ["Approx"]
         if has_core:
             headers += ["Has Core"]
         ws_data.append(headers)
         for i, p in enumerate(particles):
-            row = [i + 1, p["diameter"], p["area"], p["center_x"], p["center_y"]]
+            row = [i + 1, p["diameter"], p["radius_px"] * 2, p["area"],
+                   p["center_x"], p["center_y"]]
             row += ["Y" if p.get("approx") else "N"]
             if has_core:
                 row += ["Y" if p["has_core"] else "N"]

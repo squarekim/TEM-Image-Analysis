@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tem_analyzer.analyzer import ParticleAnalyzer, load_image  # noqa: E402
 from tests.generate_dense_image import generate_dense_tem_image  # noqa: E402
+from tests.generate_fringed_image import generate_fringed_image  # noqa: E402
 from tests.generate_grainy_image import generate_grainy_image  # noqa: E402
 from tests.generate_hard_image import generate_hard_tem_image  # noqa: E402
 from tests.generate_hollow_image import generate_hollow_tem_image  # noqa: E402
@@ -79,6 +80,8 @@ def main():
          lambda p: [(x, y, r) for x, y, r, _ in generate_dense_tem_image(p)[0]]),
         ("grainy", "grainy.png",
          lambda p: generate_grainy_image(p)),
+        ("fringed", "fringed.png",
+         lambda p: generate_fringed_image(p)),
     ]
 
     results = {}
