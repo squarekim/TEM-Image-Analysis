@@ -33,6 +33,7 @@ class ImageLabel(QLabel):
         self._pixmap = None
         self.click_callback = None
         self.measure_callback = None
+        self.measuring_callback = None
         self.measure_mode = False
         self._drag_start = None
         self._drag_end = None
@@ -82,6 +83,21 @@ class ImageLabel(QLabel):
         self._update_display()
         super().resizeEvent(event)
 
+    def _constrain(self, pos, modifiers):
+        """Hold Shift to lock the drag to the horizontal or vertical axis.
+
+        Scale bars are drawn straight, so a hand-drawn line across one is
+        always a little tilted - which both looks wrong and shortens the
+        reading by the cosine of the angle.
+        """
+        if not (modifiers & Qt.ShiftModifier) or self._drag_start is None:
+            return pos
+        dx = pos.x() - self._drag_start.x()
+        dy = pos.y() - self._drag_start.y()
+        if abs(dx) >= abs(dy):
+            return QPoint(pos.x(), self._drag_start.y())
+        return QPoint(self._drag_start.x(), pos.y())
+
     def mousePressEvent(self, event):
         if self._pixmap and self.measure_mode:
             self._drag_start = event.pos()
@@ -95,13 +111,19 @@ class ImageLabel(QLabel):
 
     def mouseMoveEvent(self, event):
         if self.measure_mode and self._drag_start:
-            self._drag_end = event.pos()
+            self._drag_end = self._constrain(event.pos(), event.modifiers())
             self._update_display()
+            if self.measuring_callback:
+                start = self._to_image_coords(self._drag_start)
+                end = self._to_image_coords(self._drag_end)
+                if start and end:
+                    self.measuring_callback(start, end,
+                                            bool(event.modifiers() & Qt.ShiftModifier))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self.measure_mode and self._drag_start:
-            self._drag_end = event.pos()
+            self._drag_end = self._constrain(event.pos(), event.modifiers())
             self._update_display()
             start = self._to_image_coords(self._drag_start)
             end = self._to_image_coords(self._drag_end)
@@ -192,6 +214,7 @@ class MainWindow(QMainWindow):
         self.image_label = ImageLabel()
         self.image_label.click_callback = self._on_image_click
         self.image_label.measure_callback = self._on_scalebar_measured
+        self.image_label.measuring_callback = self._on_scalebar_measuring
         left_layout.addWidget(self.image_label, stretch=3)
 
         self.histogram = HistogramCanvas()
@@ -222,7 +245,8 @@ class MainWindow(QMainWindow):
         self.btn_measure.setCheckable(True)
         self.btn_measure.setEnabled(False)
         self.btn_measure.setToolTip(
-            "누른 뒤 이미지 위의 스케일바 양 끝을 드래그하면 픽셀 길이가 자동 입력됩니다")
+            "누른 뒤 이미지 위의 스케일바 양 끝을 드래그하면 픽셀 길이가 자동 입력됩니다.\n"
+            "Shift를 누른 채 끌면 선이 수평/수직으로 고정되어 기울지 않습니다.")
         self.btn_measure.toggled.connect(self._toggle_measure_mode)
         scale_form.addRow(self.btn_measure)
 
@@ -347,7 +371,16 @@ class MainWindow(QMainWindow):
         self.image_label.setCursor(Qt.CrossCursor if checked else Qt.ArrowCursor)
         if checked:
             self.statusBar().showMessage(
-                "이미지 위의 스케일바 왼쪽 끝에서 오른쪽 끝까지 드래그하세요.")
+                "이미지 위의 스케일바를 따라 드래그하세요. "
+                "Shift를 누른 채 끌면 수평/수직으로 고정됩니다.")
+
+    def _on_scalebar_measuring(self, start, end, locked):
+        scale = getattr(self, "_display_scale", 1.0) or 1.0
+        dx = (end[0] - start[0]) / scale
+        dy = (end[1] - start[1]) / scale
+        hint = "축 고정 (Shift)" if locked else "Shift를 누르면 수평/수직으로 고정"
+        self.statusBar().showMessage(
+            f"드래그 중: {np.hypot(dx, dy):.1f} px   —   {hint}")
 
     def _on_scalebar_measured(self, start, end):
         scale = getattr(self, "_display_scale", 1.0) or 1.0
