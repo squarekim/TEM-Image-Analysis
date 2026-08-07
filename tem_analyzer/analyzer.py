@@ -1,4 +1,6 @@
 import cv2
+import warnings
+
 import numpy as np
 import os
 import re
@@ -627,11 +629,16 @@ class ParticleAnalyzer:
         if cavity is None or shell is None:
             return None
         # The cavity has to stand out from the shell about as clearly as the
-        # particle stands out from its surroundings. A solid particle's own
-        # texture clears a fixed threshold often enough to be useless.
+        # particle stands out from its surroundings - and no more clearly. A
+        # solid particle's own texture clears a fixed threshold often enough to
+        # be useless, and when it does it produces an "inner wall" sharper than
+        # the particle's real edge, which no cavity can be: the shell wall is
+        # seen through the shell, the outer edge is not.
         inner_contrast = abs(cavity - shell)
         edge_contrast = abs(shell - outside) if outside is not None else inner_contrast
-        if inner_contrast < 25 or inner_contrast < 0.55 * edge_contrast:
+        if inner_contrast < 25:
+            return None
+        if not (0.55 * edge_contrast <= inner_contrast <= 1.4 * edge_contrast):
             return None
         return float(inner_r)
 
@@ -680,6 +687,18 @@ class ParticleAnalyzer:
         outermost = strength.shape[1] - 1 - np.argmax(significant[:, ::-1], axis=1)
         has_outer = significant.any(axis=1)
 
+        # A rimmed particle offers two crests on every ray - into the dark rim
+        # and out of it - and noise decides which one clears the threshold. Left
+        # to itself the choice flips from angle to angle and the traced outline
+        # saws back and forth across the rim. Real boundaries move smoothly, so
+        # the pick is tied to a smoothed running estimate of the radius: still
+        # the outermost crest, but only among those near where the neighbouring
+        # angles landed.
+        outermost, has_outer = ParticleAnalyzer._regularize_trace(
+            significant, strength, radii, outermost, has_outer, r0, prefer="outer")
+        strongest, enough = ParticleAnalyzer._regularize_trace(
+            significant, strength, radii, strongest, enough, r0, prefer="strong")
+
         def pick(index, ok):
             return (np.where(ok, radii[index], np.nan),
                     np.where(ok, strength[rows_idx, index], 0.0))
@@ -687,6 +706,56 @@ class ParticleAnalyzer:
         r_strong, s_strong = pick(strongest, enough)
         r_outer, s_outer = pick(outermost, enough & has_outer)
         return angles, r_strong, s_strong, r_outer, s_outer
+
+    @staticmethod
+    def _smooth_radii(r_ang, win=9):
+        """Circular median filter that ignores, and then fills, missing angles."""
+        n = len(r_ang)
+        offsets = np.arange(-(win // 2), win // 2 + 1)
+        window = r_ang[(np.arange(n)[:, None] + offsets[None, :]) % n]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN windows
+            smoothed = np.nanmedian(window, axis=1)
+        if np.isnan(smoothed).any():
+            fill = np.nanmedian(r_ang) if not np.isnan(r_ang).all() else np.nan
+            smoothed = np.where(np.isnan(smoothed), fill, smoothed)
+        return smoothed
+
+    @staticmethod
+    def _regularize_trace(significant, strength, radii, index0, ok0, r0,
+                          prefer="outer", rounds=3):
+        """Re-pick each angle's edge near where its neighbours put theirs.
+
+        ``prefer`` keeps the original selection rule - the outermost crest, or
+        the strongest one - but applies it only to candidates close to a
+        smoothed running estimate of the radius. Angles whose candidates all sit
+        far from that estimate are dropped rather than forced, so a genuine gap
+        in the edge stays a gap instead of becoming an invented radius.
+        """
+        reference = ParticleAnalyzer._smooth_radii(
+            np.where(ok0, radii[index0], np.nan))
+        if np.isnan(reference).all():
+            return index0, ok0
+
+        tol = max(2.0, 0.06 * r0)
+        index, ok = index0, ok0
+        for _ in range(rounds):
+            near = significant & (np.abs(radii[None, :] - reference[:, None]) <= tol)
+            # Only ever narrows the accepted angles: an angle the caller had
+            # already rejected must not come back just because it now has a
+            # candidate near the smoothed radius.
+            ok = ok0 & near.any(axis=1)
+            if not ok.any():
+                return index0, ok0
+            if prefer == "strong":
+                index = np.argmax(np.where(near, strength, -np.inf), axis=1)
+            else:
+                index = near.shape[1] - 1 - np.argmax(near[:, ::-1], axis=1)
+            updated = ParticleAnalyzer._smooth_radii(np.where(ok, radii[index], np.nan))
+            if np.allclose(updated, reference, equal_nan=True):
+                break
+            reference = updated
+        return index, ok
 
     @staticmethod
     def _smoothed_spread(r_ang, good, win=5):
@@ -852,13 +921,22 @@ class ParticleAnalyzer:
 
     @staticmethod
     def _find_scalebar_top(gray):
+        """Row where the black info bar at the bottom starts, or h if there is none.
+
+        The band has to be walked up to its top edge: returning the first dark
+        row met from the bottom returns the band's *bottom*, which leaves the
+        whole strip inside the analysis region, and the bar and its lettering
+        then get measured as particles.
+        """
         h, w = gray.shape
-        for row in range(h - 1, int(h * 0.7), -1):
-            line = gray[row, :]
-            dark_ratio = np.sum(line < 30) / w
-            if dark_ratio > 0.5:
-                return row
-        return h
+        limit = int(h * 0.7)
+        dark = (gray < 30).sum(axis=1) / w > 0.5
+        if not dark[h - 1]:
+            return h
+        row = h - 1
+        while row > limit and dark[row - 1]:
+            row -= 1
+        return row
 
     @staticmethod
     def snap_scalebar(image, start, end):
