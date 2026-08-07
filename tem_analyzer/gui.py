@@ -515,6 +515,14 @@ class MainWindow(QMainWindow):
         self.chk_core.setToolTip("중공 입자 내부의 코어 입자를 감지하고 보유 비율을 계산")
         param_form.addRow(self.chk_core)
 
+        self.chk_mark_inferred = QCheckBox("미측정 구간 가늘게 표시")
+        self.chk_mark_inferred.setChecked(False)
+        self.chk_mark_inferred.setToolTip(
+            "입자끼리 맞닿아 경계가 보이지 않는 구간을 가는 선으로 구분해 표시합니다.\n"
+            "어디까지가 실측인지 확인할 때 켜세요. 끄면 경계선을 한 굵기로 그립니다.")
+        self.chk_mark_inferred.toggled.connect(self._redraw_results)
+        param_form.addRow(self.chk_mark_inferred)
+
         param_group.setLayout(param_form)
         right_layout.addWidget(param_group)
 
@@ -721,6 +729,11 @@ class MainWindow(QMainWindow):
             msg += f"  |  겹치는 검출 {n_overlap}쌍 (보라색) - 중복 여부 확인 필요"
         self.statusBar().showMessage(msg)
 
+    def _redraw_results(self):
+        """Re-render the annotated view without re-running the analysis."""
+        if self.particles and self.original_image is not None:
+            self._draw_results()
+
     def _valid_particles(self):
         return [p for p in self.particles if not p.get("excluded")]
 
@@ -777,7 +790,8 @@ class MainWindow(QMainWindow):
                 # half-pixel wobble into a `scale`-pixel staircase.
                 scaled_cnt = np.round(p["contour"].astype(np.float64) * scale).astype(np.int32)
                 self._draw_boundary(display, scaled_cnt, (cx, cy), color, thickness,
-                                    p.get("contour_measured"))
+                                    p.get("contour_measured"),
+                                    self.chk_mark_inferred.isChecked())
             else:
                 cv2.circle(display, (cx, cy), r, color, thickness)
             if excluded:
@@ -812,27 +826,27 @@ class MainWindow(QMainWindow):
         self._display_image(display)
 
     @staticmethod
-    def _draw_boundary(display, contour, center, color, thickness, measured=None):
-        """Draw the outline all the way round, thin where the edge was inferred.
+    def _draw_boundary(display, contour, center, color, thickness, measured=None,
+                       mark_inferred=False):
+        """Draw the closed outline round the particle.
 
-        A particle pressed against its neighbours has no edge to find on the
-        contact side. Leaving those stretches blank drew the boundary in
-        pieces; drawing them like the rest would present a guess as an
-        observation. They are drawn thin instead, so the boundary closes and
-        still reads as measured-versus-carried-across at a glance.
+        By default the whole boundary is drawn at one weight, because a
+        boundary drawn in pieces is not a boundary. With ``mark_inferred`` the
+        stretches whose edge was never found - the contact sides, where a
+        neighbour is pressed against this particle - are drawn as a hairline
+        instead, which shows how much of the outline rests on a measurement at
+        the cost of a busier picture.
         """
         pts = contour.reshape(-1, 2)
         if len(pts) < 2:
             return
-        if measured is None or len(measured) != len(pts):
-            measured = np.ones(len(pts), bool)
+        closed = np.vstack([pts, pts[:1]]).reshape(-1, 1, 2).astype(np.int32)
 
-        thin = max(1, thickness - 2)
-        closed = np.vstack([pts, pts[:1]])
-        cv2.polylines(display, [closed.reshape(-1, 1, 2).astype(np.int32)],
-                      False, color, thin)
+        if measured is None or len(measured) != len(pts) or not mark_inferred:
+            cv2.polylines(display, [closed], False, color, thickness)
+            return
 
-        # Then lay the measured arcs over the top at full weight.
+        cv2.polylines(display, [closed], False, color, max(1, thickness - 2))
         runs, run = [], []
         for i, on in enumerate(measured):
             if on:

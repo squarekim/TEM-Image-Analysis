@@ -335,11 +335,21 @@ class ParticleAnalyzer:
         score_thresh = np.percentile(strong_scores, 30)
         outer_thresh = score_thresh * 0.4
 
+        # Fit both transitions everywhere first, then let the field as a whole
+        # decide which one is the boundary. Particles in one image are the same
+        # kind of object imaged the same way, so a rim resolved on one is a rim
+        # on all; choosing per particle is what made neighbouring particles come
+        # out a rim-thickness apart in diameter for no physical reason.
+        candidates = [self._boundary_candidates(cx, cy, trace[0], trace, score_thresh,
+                                                r, outer_thresh, blurred)
+                      for (cx, cy, r), trace in zip(expanded, traces)]
+        decidable = [c for c in candidates if c["strong"] is not None and c["outer"] is not None]
+        use_outer = bool(decidable) and sum(c["qualifies"] for c in decidable) >= 0.5 * len(decidable)
+
         particles = []
-        for (cx, cy, r), trace in zip(expanded, traces):
+        for (cx, cy, r), trace, candidate in zip(expanded, traces, candidates):
             angles = trace[0]
-            fit, r_ang, s_ang, used_thresh = self._choose_boundary(
-                cx, cy, angles, trace, score_thresh, r, outer_thresh, blurred)
+            fit, r_ang, s_ang, used_thresh = self._select_boundary(candidate, use_outer)
             if fit is None:
                 continue
             ux, uy, rr, coverage, rms, (pts, measured) = fit
@@ -522,6 +532,13 @@ class ParticleAnalyzer:
         and comparing settles it: a real outer rim is circular and fits about
         as well as the strong edge, whereas noise does not.
         """
+        candidate = self._boundary_candidates(cx, cy, angles, trace, score_thresh,
+                                              r0, outer_thresh, blurred)
+        return self._select_boundary(candidate, candidate["qualifies"])
+
+    def _boundary_candidates(self, cx, cy, angles, trace, score_thresh, r0,
+                             outer_thresh=None, blurred=None):
+        """Fit both transitions and judge whether the outer one is a real rim."""
         _, r_strong, s_strong, r_outer, s_outer = trace
         if outer_thresh is None:
             outer_thresh = score_thresh
@@ -529,29 +546,49 @@ class ParticleAnalyzer:
                                          score_thresh, r0=r0)
         outer = self._robust_circle_fit(cx, cy, angles, r_outer, s_outer,
                                         outer_thresh, r0=r0)
-        if outer is None:
-            return strong, r_strong, s_strong, score_thresh
-        if strong is None:
-            return outer, r_outer, s_outer, outer_thresh
-        if outer[2] <= strong[2] + 0.5:
-            # no further out; nothing to gain
-            return strong, r_strong, s_strong, score_thresh
-        # Only trust the outer transition when it is a coherent rim in its own
-        # right: seen around most of the particle, circular to the same standard
-        # demanded of an ordinary edge, and carrying a real share of the edge
-        # strength. Noise clears the geometric tests often enough on its own.
-        live_outer = s_outer[s_outer > 0]
-        live_strong = s_strong[s_strong > 0]
-        if live_outer.size and live_strong.size:
-            strength_ratio = np.median(live_outer) / max(np.median(live_strong), 1e-6)
-        else:
-            strength_ratio = 0.0
-        if (outer[3] >= 0.55 and outer[4] <= 0.10
+
+        qualifies = False
+        if outer is not None and strong is not None and outer[2] > strong[2] + 0.5:
+            # A real outer rim is seen around most of the particle, is circular
+            # to the standard demanded of an ordinary edge, and carries a real
+            # share of the edge strength. Noise clears the geometric tests
+            # often enough on its own.
+            live_outer, live_strong = s_outer[s_outer > 0], s_strong[s_strong > 0]
+            strength_ratio = (np.median(live_outer) / max(np.median(live_strong), 1e-6)
+                              if live_outer.size and live_strong.size else 0.0)
+            qualifies = bool(
+                outer[3] >= 0.55 and outer[4] <= 0.10
                 and outer[3] >= strong[3] * 0.8 and strength_ratio >= 0.35
                 and (blurred is None
-                     or self._has_rim_between(blurred, cx, cy, strong[2], outer[2]))):
-            return outer, r_outer, s_outer, outer_thresh
-        return strong, r_strong, s_strong, score_thresh
+                     or self._has_rim_between(blurred, cx, cy, strong[2], outer[2])))
+
+        return {"strong": strong, "outer": outer, "qualifies": qualifies,
+                "r_strong": r_strong, "s_strong": s_strong,
+                "r_outer": r_outer, "s_outer": s_outer,
+                "score_thresh": score_thresh, "outer_thresh": outer_thresh}
+
+    @staticmethod
+    def _select_boundary(c, use_outer):
+        """Pick one of the two fitted transitions.
+
+        ``use_outer`` is decided once for the whole image rather than per
+        particle. Every particle in a field is the same kind of object imaged
+        the same way, so the boundary has to be the same feature on all of
+        them; deciding one at a time lets some land on the inner flank of the
+        rim and others on the outer, and the diameters then differ by the rim
+        thickness for no physical reason.
+        """
+        strong, outer = c["strong"], c["outer"]
+        if outer is None:
+            return strong, c["r_strong"], c["s_strong"], c["score_thresh"]
+        if strong is None:
+            return outer, c["r_outer"], c["s_outer"], c["outer_thresh"]
+        # Held to a looser standard than the vote itself: the image has already
+        # established that these particles have a rim, so a slightly ragged
+        # outer edge is still the right feature to measure.
+        if use_outer and outer[2] > strong[2] + 0.5 and outer[3] >= 0.35 and outer[4] <= 0.20:
+            return outer, c["r_outer"], c["s_outer"], c["outer_thresh"]
+        return strong, c["r_strong"], c["s_strong"], c["score_thresh"]
 
     def _record_shell(self, particle, inner_r):
         """Attach shell thickness and void fraction to a particle record."""
@@ -963,9 +1000,14 @@ class ParticleAnalyzer:
             radius = np.interp(grid, wrapped_t, wrapped_r)
             # Mark which stretches rest on a found edge and which were carried
             # across, so the drawing can say which is which instead of
-            # presenting a guess as an observation.
-            hi = np.clip(np.searchsorted(wrapped_t, grid), 1, len(wrapped_t) - 1)
-            measured = (wrapped_t[hi] - wrapped_t[hi - 1]) <= np.deg2rad(12)
+            # presenting a guess as an observation. The test is nearness to an
+            # actual sample: judging it by the width of the bracketing interval
+            # instead calls the whole outline inferred as soon as the surviving
+            # samples are a little sparse, however well the edge was seen.
+            gap = np.abs(grid[:, None] - theta[None, :])
+            nearest = np.minimum(gap, 2 * np.pi - gap).min(axis=1)
+            step = np.median(np.diff(theta)) if len(theta) > 2 else np.deg2rad(4)
+            measured = nearest <= max(np.deg2rad(5), float(step))
         else:
             radius = np.full(n, r)
             measured = np.zeros(n, bool)
