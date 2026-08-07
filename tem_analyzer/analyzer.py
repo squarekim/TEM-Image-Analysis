@@ -490,38 +490,6 @@ class ParticleAnalyzer:
                 best_est = self._radius_mode(circles[:, 2])
         return best_est
 
-    @staticmethod
-    def _has_rim_between(blurred, cx, cy, r_inner, r_outer):
-        """True when a distinct band sits between the two candidate radii.
-
-        A particle ringed by a rim shows two transitions with the rim's own
-        brightness between them. A single soft edge also produces a second,
-        weaker crest further out - just a ripple of the same transition - and
-        there the profile runs straight from one radius to the other. Requiring
-        a genuine extremum in between separates the two.
-        """
-        h, w = blurred.shape
-        if r_outer - r_inner < 2:
-            return False
-        radii = np.linspace(r_inner, r_outer, 12)
-        angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
-        levels = []
-        for r in radii:
-            xs = (cx + r * np.cos(angles)).astype(int)
-            ys = (cy + r * np.sin(angles)).astype(int)
-            v = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-            if v.sum() < len(angles) * 0.5:
-                return False
-            levels.append(float(np.median(blurred[ys[v], xs[v]])))
-        levels = np.array(levels)
-        # Deviation from the straight line joining the endpoints. A single
-        # transition runs monotonically between the two radii and hugs that
-        # line; a rim bulges away from it.
-        line = np.linspace(levels[0], levels[-1], len(levels))
-        deviation = np.abs(levels - line).max()
-        span = max(abs(levels[0] - levels[-1]), 1.0)
-        return deviation > 0.3 * span + 8.0
-
     def _choose_boundary(self, cx, cy, angles, trace, score_thresh, r0,
                          outer_thresh=None, blurred=None):
         """Fit the outer transition when it holds up, else the strongest one.
@@ -561,13 +529,19 @@ class ParticleAnalyzer:
 
         band = (radii >= 0.65 * r0) & (radii <= 1.25 * r0)
         far = radii >= 1.35 * r0
+        core = (radii >= 0.5 * r0) & (radii <= 0.62 * r0)
         if not band.any() or not far.any():
-            return np.full(len(angles), np.nan), np.zeros(len(angles))
+            return np.full(len(angles), np.nan), np.zeros(len(angles)), 0.0
 
-        outside = np.median(np.where(inside[:, far], prof[:, far], np.nan), axis=1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            outside = np.nanmedian(np.where(inside[:, far], prof[:, far], np.nan), axis=1)
+            interior = (np.nanmedian(np.where(inside[:, core], prof[:, core], np.nan), axis=1)
+                        if core.any() else np.full(len(angles), np.nan))
         r_out = np.full(len(angles), np.nan)
         s_out = np.zeros(len(angles))
         band_idx = np.flatnonzero(band)
+        rim_votes = []
 
         for i in range(len(angles)):
             if not np.isfinite(outside[i]) or inside[i].sum() < len(radii) * 0.5:
@@ -582,6 +556,14 @@ class ParticleAnalyzer:
             contrast = abs(outside[i] - extreme)
             if contrast < 4:
                 continue
+            # A rim is a band that stands out from the particle's own interior,
+            # not merely a step from interior to background. Asking instead
+            # whether a dark dip sits between the steepest point and this one
+            # cannot work here: half-recovery is on the far flank of that same
+            # dip, so the profile between them only ever rises.
+            if np.isfinite(interior[i]):
+                rim_votes.append(abs(interior[i] - extreme)
+                                 >= max(12.0, 0.50 * contrast))
             target = extreme + frac * (outside[i] - extreme)
             tail = prof[i, k:]
             crossed = (tail >= target) if dark else (tail <= target)
@@ -597,7 +579,8 @@ class ParticleAnalyzer:
             else:
                 r_out[i] = radii[idx]
             s_out[i] = contrast
-        return r_out, s_out
+        rim_frac = float(np.mean(rim_votes)) if rim_votes else 0.0
+        return r_out, s_out, rim_frac
 
     def _boundary_candidates(self, cx, cy, angles, trace, score_thresh, r0,
                              outer_thresh=None, blurred=None):
@@ -608,9 +591,11 @@ class ParticleAnalyzer:
         strong = self._robust_circle_fit(cx, cy, angles, r_strong, s_strong,
                                          score_thresh, r0=r0)
 
+        rim_frac = 0.0
         if blurred is not None:
             h, w = blurred.shape
-            r_level, s_level = self._outer_by_level(blurred, cx, cy, r0, angles, w, h)
+            r_level, s_level, rim_frac = self._outer_by_level(blurred, cx, cy, r0,
+                                                              angles, w, h)
             if np.isfinite(r_level).sum() >= 8:
                 r_outer, s_outer = r_level, s_level
                 outer_thresh = max(4.0, np.percentile(s_level[s_level > 0], 25)) \
@@ -637,10 +622,10 @@ class ParticleAnalyzer:
             # really does lie between it and the inner edge.
             qualifies = bool(
                 outer[3] >= 0.30 and outer[4] <= 0.12
-                and (blurred is None
-                     or self._has_rim_between(blurred, cx, cy, strong[2], outer[2])))
+                and (blurred is None or rim_frac >= 0.5))
 
         return {"strong": strong, "outer": outer, "qualifies": qualifies,
+                "rim_frac": rim_frac,
                 "r_strong": r_strong, "s_strong": s_strong,
                 "r_outer": r_outer, "s_outer": s_outer,
                 "score_thresh": score_thresh, "outer_thresh": outer_thresh}
