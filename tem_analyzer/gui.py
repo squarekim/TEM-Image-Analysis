@@ -724,22 +724,6 @@ class MainWindow(QMainWindow):
     def _valid_particles(self):
         return [p for p in self.particles if not p.get("excluded")]
 
-    @staticmethod
-    def _overlap_fraction(d, r1, r2):
-        """Area shared by two circles, as a fraction of the smaller one's area."""
-        small, large = min(r1, r2), max(r1, r2)
-        if small <= 0:
-            return 0.0
-        if d >= r1 + r2:
-            return 0.0
-        if d <= large - small:
-            return 1.0            # the smaller circle is entirely inside
-        d1 = (d * d + r1 * r1 - r2 * r2) / (2 * d)
-        d2 = d - d1
-        area = (r1 * r1 * np.arccos(np.clip(d1 / r1, -1, 1)) - d1 * np.sqrt(max(r1 * r1 - d1 * d1, 0))
-                + r2 * r2 * np.arccos(np.clip(d2 / r2, -1, 1)) - d2 * np.sqrt(max(r2 * r2 - d2 * d2, 0)))
-        return float(area / (np.pi * small * small))
-
     def _overlapping_pairs(self):
         """Valid detections that sit substantially on top of one another.
 
@@ -760,7 +744,7 @@ class MainWindow(QMainWindow):
                 q = valid[j]
                 d = np.hypot(p["center_x"] - q["center_x"],
                              p["center_y"] - q["center_y"])
-                if self._overlap_fraction(d, p["radius_px"], q["radius_px"]) > 0.30:
+                if ParticleAnalyzer.overlap_fraction(d, p["radius_px"], q["radius_px"]) > 0.30:
                     pairs += 1
                     flagged.add(id(p))
                     flagged.add(id(q))
@@ -773,6 +757,7 @@ class MainWindow(QMainWindow):
         display = cv2.resize(self.original_image, None, fx=scale, fy=scale,
                              interpolation=cv2.INTER_CUBIC) if scale > 1 else self.original_image.copy()
         thickness = max(2, scale)
+        _, overlapping = self._overlapping_pairs()
         num = 0
         for p in self.particles:
             cx, cy = p["center_x"] * scale, p["center_y"] * scale
@@ -780,6 +765,8 @@ class MainWindow(QMainWindow):
             excluded = p.get("excluded", False)
             if excluded:
                 color = (0, 0, 255)
+            elif p.get("overlap") or id(p) in overlapping:
+                color = (255, 0, 255)
             elif p.get("approx"):
                 color = (0, 220, 220)
             else:

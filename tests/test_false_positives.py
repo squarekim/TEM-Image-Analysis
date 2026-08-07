@@ -25,6 +25,12 @@ failures = []
 
 
 def check(name, got, want, tol=0.0):
+    if isinstance(want, tuple):
+        ok = tuple(got) == want
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}: {got}  (기대 {want})")
+        if not ok:
+            failures.append(name)
+        return
     ok = abs(float(got) - float(want)) <= tol
     print(f"  {'PASS' if ok else 'FAIL'}  {name}: {got}  (기대 {want})")
     if not ok:
@@ -33,7 +39,7 @@ def check(name, got, want, tol=0.0):
 
 def test_overlap_fraction():
     print("겹침 면적 비율 (작은 원 기준)")
-    f = MainWindow._overlap_fraction
+    f = ParticleAnalyzer.overlap_fraction
     check("떨어져 있음", f(100, 30, 30), 0.0)
     check("접함", f(60, 30, 30), 0.0)
     check("작은 원이 완전히 안에", f(10, 80, 20), 1.0)
@@ -79,8 +85,39 @@ def test_no_void_detections():
     check("빈틈 오검출", spurious, 0)
 
 
+def test_overlap_resolution():
+    """A guess lying on a measured particle is dropped; two measured ones are not."""
+    print("\n겹친 검출 정리")
+
+    def particle(x, r, approx):
+        return {"center_x": x, "center_y": 0, "radius_px": r,
+                "approx": approx, "excluded": False}
+
+    # A large approximated circle sitting over a confidently measured one -
+    # the case a person reads instantly as "that is not a particle".
+    guess, measured = particle(0, 60, True), particle(40, 55, False)
+    ParticleAnalyzer._resolve_overlaps([guess, measured])
+    check("근사 검출이 제외됨", guess["excluded"], True)
+    check("측정된 입자는 유지", measured["excluded"], False)
+
+    # Two particles that genuinely overlap in projection, both measured:
+    # neither may be dropped, but the pair is marked so it can be checked.
+    a, b = particle(0, 55, False), particle(45, 55, False)
+    ParticleAnalyzer._resolve_overlaps([a, b])
+    check("둘 다 측정됨 - 유지", (a["excluded"], b["excluded"]), (False, False))
+    check("겹침으로 표시", (a["overlap"], b["overlap"]), (True, True))
+
+    # Ordinary packed neighbours overlap far less than the threshold.
+    c, d = particle(0, 55, False), particle(95, 55, True)
+    frac = ParticleAnalyzer.overlap_fraction(95, 55, 55)
+    ParticleAnalyzer._resolve_overlaps([c, d])
+    print(f"        (이웃한 입자끼리의 겹침 비율 {frac:.2f} - 임계값 0.30 미만)")
+    check("가볍게 닿은 이웃은 건드리지 않음", (c["excluded"], d["excluded"]), (False, False))
+
+
 def main():
     test_overlap_fraction()
+    test_overlap_resolution()
     test_no_void_detections()
     print("\n" + ("전체 통과" if not failures else f"실패: {failures}"))
     return 1 if failures else 0

@@ -216,6 +216,7 @@ class ParticleAnalyzer:
             particles = kept
 
         self._reject_implausible_interiors(particles, analysis_region)
+        self._resolve_overlaps(particles)
 
         if measure_shell:
             blur3 = cv2.GaussianBlur(analysis_region, (3, 3), 0)
@@ -344,6 +345,7 @@ class ParticleAnalyzer:
             ux, uy, rr, coverage, rms, (pts, measured) = fit
             ux, uy, rr = int(round(ux)), int(round(uy)), rr
             p = self._measure_circle(ux, uy, rr, np.pi * rr * rr)
+            p["coverage"] = float(coverage)
             p["contour"] = pts.reshape(-1, 1, 2).astype(np.float32)
             p["contour_measured"] = measured
             center_inside = 4 <= ux <= w - 4 and 4 <= uy <= h - 4
@@ -709,6 +711,56 @@ class ParticleAnalyzer:
         r_strong, s_strong = pick(strongest, enough)
         r_outer, s_outer = pick(outermost, enough & has_outer)
         return angles, r_strong, s_strong, r_outer, s_outer
+
+    @staticmethod
+    def overlap_fraction(d, r1, r2):
+        """Area shared by two circles, as a fraction of the smaller one's area."""
+        small, large = min(r1, r2), max(r1, r2)
+        if small <= 0 or d >= r1 + r2:
+            return 0.0
+        if d <= large - small:
+            return 1.0            # the smaller circle is entirely inside
+        d1 = (d * d + r1 * r1 - r2 * r2) / (2 * d)
+        d2 = d - d1
+        area = (r1 * r1 * np.arccos(np.clip(d1 / r1, -1, 1))
+                - d1 * np.sqrt(max(r1 * r1 - d1 * d1, 0))
+                + r2 * r2 * np.arccos(np.clip(d2 / r2, -1, 1))
+                - d2 * np.sqrt(max(r2 * r2 - d2 * d2, 0)))
+        return float(area / (np.pi * small * small))
+
+    @staticmethod
+    def _resolve_overlaps(particles, thresh=0.30):
+        """Settle detections that sit on top of one another.
+
+        Particles in a packed monolayer really do overlap in projection - up to
+        about 0.19 of the smaller one on the packed fixtures, 0.39 where the
+        generator deliberately overlaps a pair - so overlap alone cannot mean
+        one of them is wrong, and dropping on overlap alone would delete real
+        particles.
+
+        What is wrong is a guess lying on top of a confident measurement: an
+        approximated circle, most of whose boundary was carried across rather
+        than found, overlapping a particle whose edge was actually traced. That
+        one is excluded. Where both are equally confident the pair is left
+        alone and marked, so it is visible rather than silently resolved.
+        """
+        for p in particles:
+            p.setdefault("overlap", False)
+        live = [p for p in particles if not p.get("excluded")]
+        for i, p in enumerate(live):
+            for q in live[i + 1:]:
+                if p.get("excluded") or q.get("excluded"):
+                    continue
+                d = float(np.hypot(p["center_x"] - q["center_x"],
+                                   p["center_y"] - q["center_y"]))
+                if ParticleAnalyzer.overlap_fraction(d, p["radius_px"], q["radius_px"]) <= thresh:
+                    continue
+                if p.get("approx") != q.get("approx"):
+                    loser = p if p.get("approx") else q
+                    loser["excluded"] = True
+                    loser["approx"] = False
+                else:
+                    p["overlap"] = q["overlap"] = True
 
     @staticmethod
     def _reject_implausible_interiors(particles, gray, floor=20.0, k=6.0):
