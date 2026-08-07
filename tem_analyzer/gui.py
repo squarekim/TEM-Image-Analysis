@@ -515,6 +515,16 @@ class MainWindow(QMainWindow):
         self.chk_core.setToolTip("중공 입자 내부의 코어 입자를 감지하고 보유 비율을 계산")
         param_form.addRow(self.chk_core)
 
+        self.spin_edge = QSpinBox()
+        self.spin_edge.setRange(15, 85)
+        self.spin_edge.setValue(int(ParticleAnalyzer.DEFAULT_EDGE_LEVEL * 100))
+        self.spin_edge.setSuffix(" %")
+        self.spin_edge.setToolTip(
+            "테두리가 흐릿할 때 경계를 어디로 볼지 정합니다.\n"
+            "테두리의 가장 어두운 지점(0%)에서 바깥 밝기로 회복되는 지점(100%) 사이의 위치입니다.\n"
+            "낮추면 입자가 작게, 높이면 크게 측정됩니다. 손으로 재던 값과 맞추세요.")
+        param_form.addRow("경계 기준:", self.spin_edge)
+
         self.chk_mark_inferred = QCheckBox("미측정 구간 가늘게 표시")
         self.chk_mark_inferred.setChecked(False)
         self.chk_mark_inferred.setToolTip(
@@ -695,7 +705,8 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
         try:
-            analyzer = ParticleAnalyzer(nm_per_px=self.nm_per_px)
+            analyzer = ParticleAnalyzer(nm_per_px=self.nm_per_px,
+                                        edge_level=self.spin_edge.value() / 100.0)
             self.particles = analyzer.analyze(
                 self.original_image,
                 min_area_px=self.spin_min_area.value(),

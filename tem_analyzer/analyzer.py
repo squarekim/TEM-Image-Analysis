@@ -147,8 +147,18 @@ class ScaleBarDetector:
 
 
 class ParticleAnalyzer:
-    def __init__(self, nm_per_px=None):
+    #: Where on the edge the boundary is taken, as a fraction of the way back
+    #: from the rim's extreme to the level outside it. Half is the standard
+    #: sub-pixel edge criterion, but where an edge fades over many pixels the
+    #: choice is genuinely the operator's: it is the same decision a person
+    #: makes about where to put the cursor, and it should be settable to match
+    #: how the sample has always been measured by hand.
+    DEFAULT_EDGE_LEVEL = 0.50
+
+    def __init__(self, nm_per_px=None, edge_level=None):
         self.nm_per_px = nm_per_px
+        self.edge_level = (self.DEFAULT_EDGE_LEVEL if edge_level is None
+                           else float(np.clip(edge_level, 0.15, 0.85)))
 
     def analyze(self, image, min_area_px=100, max_area_px=None,
                 circularity_thresh=0.5, use_watershed=True, hollow=False,
@@ -594,8 +604,8 @@ class ParticleAnalyzer:
         rim_frac = 0.0
         if blurred is not None:
             h, w = blurred.shape
-            r_level, s_level, rim_frac = self._outer_by_level(blurred, cx, cy, r0,
-                                                              angles, w, h)
+            r_level, s_level, rim_frac = self._outer_by_level(
+                blurred, cx, cy, r0, angles, w, h, frac=self.edge_level)
             if np.isfinite(r_level).sum() >= 8:
                 r_outer, s_outer = r_level, s_level
                 outer_thresh = max(4.0, np.percentile(s_level[s_level > 0], 25)) \
