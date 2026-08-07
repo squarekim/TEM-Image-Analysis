@@ -215,6 +215,8 @@ class ParticleAnalyzer:
                 kept.append(p)
             particles = kept
 
+        self._reject_implausible_interiors(particles, analysis_region)
+
         if measure_shell:
             blur3 = cv2.GaussianBlur(analysis_region, (3, 3), 0)
             sgx = cv2.Sobel(blur3, cv2.CV_32F, 1, 0, ksize=3)
@@ -706,6 +708,50 @@ class ParticleAnalyzer:
         r_strong, s_strong = pick(strongest, enough)
         r_outer, s_outer = pick(outermost, enough & has_outer)
         return angles, r_strong, s_strong, r_outer, s_outer
+
+    @staticmethod
+    def _reject_implausible_interiors(particles, gray, floor=20.0, k=6.0):
+        """Exclude detections whose inside does not look like the other particles'.
+
+        A jammed monolayer contains two things that fit a circle well but are
+        not particles: the curved triangular gap between three touching
+        particles, and the lens where two particles overlap in projection. The
+        gap reads at the background level and the lens reads darker than any
+        real particle, while the particles themselves - being the same material
+        imaged the same way - sit in a tight band.
+
+        The band is measured from the detections themselves rather than assumed,
+        so a mixed population simply widens it (via the MAD) instead of having
+        half of it thrown away. ``floor`` keeps a very uniform sample from
+        rejecting on noise-sized deviations.
+        """
+        candidates = [p for p in particles if not p.get("excluded")]
+        if len(candidates) < 5:
+            return
+
+        h, w = gray.shape
+        blurred = cv2.GaussianBlur(gray, (0, 0), 2.0)
+        angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+
+        levels = []
+        for p in candidates:
+            samples = []
+            for frac in (0.0, 0.25, 0.5, 0.75):
+                r = p["radius_px"] * frac
+                xs = np.clip((p["center_x"] + r * cos_a).astype(int), 0, w - 1)
+                ys = np.clip((p["center_y"] + r * sin_a).astype(int), 0, h - 1)
+                samples.append(np.median(blurred[ys, xs]))
+            levels.append(float(np.median(samples)))
+
+        levels = np.array(levels)
+        centre = np.median(levels)
+        mad = np.median(np.abs(levels - centre))
+        tol = max(k * mad, floor)
+        for p, level in zip(candidates, levels):
+            if abs(level - centre) > tol:
+                p["excluded"] = True
+                p["approx"] = False
 
     @staticmethod
     def _smooth_radii(r_ang, win=9):

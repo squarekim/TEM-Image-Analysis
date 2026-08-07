@@ -724,12 +724,33 @@ class MainWindow(QMainWindow):
     def _valid_particles(self):
         return [p for p in self.particles if not p.get("excluded")]
 
+    @staticmethod
+    def _overlap_fraction(d, r1, r2):
+        """Area shared by two circles, as a fraction of the smaller one's area."""
+        small, large = min(r1, r2), max(r1, r2)
+        if small <= 0:
+            return 0.0
+        if d >= r1 + r2:
+            return 0.0
+        if d <= large - small:
+            return 1.0            # the smaller circle is entirely inside
+        d1 = (d * d + r1 * r1 - r2 * r2) / (2 * d)
+        d2 = d - d1
+        area = (r1 * r1 * np.arccos(np.clip(d1 / r1, -1, 1)) - d1 * np.sqrt(max(r1 * r1 - d1 * d1, 0))
+                + r2 * r2 * np.arccos(np.clip(d2 / r2, -1, 1)) - d2 * np.sqrt(max(r2 * r2 - d2 * d2, 0)))
+        return float(area / (np.pi * small * small))
+
     def _overlapping_pairs(self):
         """Valid detections that sit substantially on top of one another.
 
         Two circles covering the same particle inflate the count without
         looking obviously wrong in a crowded field, so they are called out
         rather than left to be spotted by eye.
+
+        The test is how much of the *smaller* circle the overlap eats. Comparing
+        centre distance against the summed radii misses the case that matters
+        most - a small detection sitting almost entirely inside a large one -
+        because the large radius alone keeps the threshold out of reach.
         """
         valid = self._valid_particles()
         flagged = set()
@@ -739,7 +760,7 @@ class MainWindow(QMainWindow):
                 q = valid[j]
                 d = np.hypot(p["center_x"] - q["center_x"],
                              p["center_y"] - q["center_y"])
-                if d < 0.55 * (p["radius_px"] + q["radius_px"]):
+                if self._overlap_fraction(d, p["radius_px"], q["radius_px"]) > 0.30:
                     pairs += 1
                     flagged.add(id(p))
                     flagged.add(id(q))
