@@ -536,6 +536,69 @@ class ParticleAnalyzer:
                                               r0, outer_thresh, blurred)
         return self._select_boundary(candidate, candidate["qualifies"])
 
+    @staticmethod
+    def _outer_by_level(blurred, cx, cy, r0, angles, w, h, frac=0.5):
+        """Radius where the rim's darkening has faded back to the surroundings.
+
+        A gradient crest is only a boundary when the edge is sharp. Where the
+        rim fades outward over tens of pixels - which is what high
+        magnification makes of an edge that looked crisp at low - there is no
+        crest to find out there, so the crest search settles either on the
+        rim's inner flank or somewhere out in the tail, and which one it picks
+        swings with noise.
+
+        Half-recovery does not care how gradual the fade is: it asks where the
+        profile has come back half way from the rim's extreme to the level
+        outside, which is the point the eye reads as the edge and the standard
+        sub-pixel edge criterion. Returns per-angle radii and strengths.
+        """
+        radii = np.arange(max(2.0, r0 * 0.5), r0 * 1.6, 0.5)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        xs = (cx + np.outer(cos_a, radii)).astype(int)
+        ys = (cy + np.outer(sin_a, radii)).astype(int)
+        inside = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        prof = blurred[np.clip(ys, 0, h - 1), np.clip(xs, 0, w - 1)].astype(np.float32)
+
+        band = (radii >= 0.65 * r0) & (radii <= 1.25 * r0)
+        far = radii >= 1.35 * r0
+        if not band.any() or not far.any():
+            return np.full(len(angles), np.nan), np.zeros(len(angles))
+
+        outside = np.median(np.where(inside[:, far], prof[:, far], np.nan), axis=1)
+        r_out = np.full(len(angles), np.nan)
+        s_out = np.zeros(len(angles))
+        band_idx = np.flatnonzero(band)
+
+        for i in range(len(angles)):
+            if not np.isfinite(outside[i]) or inside[i].sum() < len(radii) * 0.5:
+                continue
+            seg = prof[i, band_idx]
+            # The rim may be darker or brighter than its surroundings; take
+            # whichever extreme departs further from the outside level.
+            lo, hi = seg.min(), seg.max()
+            dark = (outside[i] - lo) >= (hi - outside[i])
+            k = band_idx[int(np.argmin(seg) if dark else np.argmax(seg))]
+            extreme = prof[i, k]
+            contrast = abs(outside[i] - extreme)
+            if contrast < 4:
+                continue
+            target = extreme + frac * (outside[i] - extreme)
+            tail = prof[i, k:]
+            crossed = (tail >= target) if dark else (tail <= target)
+            j = int(np.argmax(crossed))
+            if not crossed[j]:
+                continue
+            # Interpolate between the two samples straddling the level.
+            idx = k + j
+            if idx > k:
+                a, b = prof[i, idx - 1], prof[i, idx]
+                t = 0.0 if b == a else (target - a) / (b - a)
+                r_out[i] = radii[idx - 1] + t * (radii[idx] - radii[idx - 1])
+            else:
+                r_out[i] = radii[idx]
+            s_out[i] = contrast
+        return r_out, s_out
+
     def _boundary_candidates(self, cx, cy, angles, trace, score_thresh, r0,
                              outer_thresh=None, blurred=None):
         """Fit both transitions and judge whether the outer one is a real rim."""
@@ -544,21 +607,36 @@ class ParticleAnalyzer:
             outer_thresh = score_thresh
         strong = self._robust_circle_fit(cx, cy, angles, r_strong, s_strong,
                                          score_thresh, r0=r0)
+
+        if blurred is not None:
+            h, w = blurred.shape
+            r_level, s_level = self._outer_by_level(blurred, cx, cy, r0, angles, w, h)
+            if np.isfinite(r_level).sum() >= 8:
+                r_outer, s_outer = r_level, s_level
+                outer_thresh = max(4.0, np.percentile(s_level[s_level > 0], 25)) \
+                    if (s_level > 0).any() else outer_thresh
         outer = self._robust_circle_fit(cx, cy, angles, r_outer, s_outer,
                                         outer_thresh, r0=r0)
 
         qualifies = False
         if outer is not None and strong is not None and outer[2] > strong[2] + 0.5:
-            # A real outer rim is seen around most of the particle, is circular
-            # to the standard demanded of an ordinary edge, and carries a real
-            # share of the edge strength. Noise clears the geometric tests
-            # often enough on its own.
-            live_outer, live_strong = s_outer[s_outer > 0], s_strong[s_strong > 0]
-            strength_ratio = (np.median(live_outer) / max(np.median(live_strong), 1e-6)
-                              if live_outer.size and live_strong.size else 0.0)
+            # The evidence has to be free of scale, or the same sample answers
+            # differently at two magnifications - which is backwards, since the
+            # higher magnification shows the rim more clearly. So: is the outer
+            # boundary seen most of the way round, is it circular, and is there
+            # actually a dark band between it and the inner edge? All three are
+            # ratios or brightness comparisons, and none of them changes when
+            # the same particle is imaged larger.
+            # Coverage is deliberately lenient. In a packed field the outer
+            # boundary simply does not exist on the contact sides - there is a
+            # neighbour there, not background for the profile to recover to -
+            # so demanding it most of the way round asks for something the
+            # sample cannot supply, and asks for less of it at low
+            # magnification than at high. What must hold is that where the
+            # outer boundary is seen it is circular, and that a dark band
+            # really does lie between it and the inner edge.
             qualifies = bool(
-                outer[3] >= 0.55 and outer[4] <= 0.10
-                and outer[3] >= strong[3] * 0.8 and strength_ratio >= 0.35
+                outer[3] >= 0.30 and outer[4] <= 0.12
                 and (blurred is None
                      or self._has_rim_between(blurred, cx, cy, strong[2], outer[2])))
 
@@ -586,7 +664,7 @@ class ParticleAnalyzer:
         # Held to a looser standard than the vote itself: the image has already
         # established that these particles have a rim, so a slightly ragged
         # outer edge is still the right feature to measure.
-        if use_outer and outer[2] > strong[2] + 0.5 and outer[3] >= 0.35 and outer[4] <= 0.20:
+        if use_outer and outer[2] > strong[2] + 0.5 and outer[3] >= 0.25 and outer[4] <= 0.20:
             return outer, c["r_outer"], c["s_outer"], c["outer_thresh"]
         return strong, c["r_strong"], c["s_strong"], c["score_thresh"]
 
