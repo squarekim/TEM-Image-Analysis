@@ -785,8 +785,11 @@ class MainWindow(QMainWindow):
             else:
                 color = (0, 220, 0)
             if p.get("contour") is not None:
-                scaled_cnt = (p["contour"].astype(np.int32) * scale)
-                self._draw_boundary(display, scaled_cnt, r, color, thickness)
+                # Scale first, then round: the outline is sub-pixel, and rounding
+                # it to whole source pixels before the upscale turns every
+                # half-pixel wobble into a `scale`-pixel staircase.
+                scaled_cnt = np.round(p["contour"].astype(np.float64) * scale).astype(np.int32)
+                self._draw_boundary(display, scaled_cnt, (cx, cy), color, thickness)
             else:
                 cv2.circle(display, (cx, cy), r, color, thickness)
             if excluded:
@@ -821,21 +824,37 @@ class MainWindow(QMainWindow):
         self._display_image(display)
 
     @staticmethod
-    def _draw_boundary(display, contour, r, color, thickness):
+    def _draw_boundary(display, contour, center, color, thickness):
+        """Draw the outline, leaving the stretches where no edge was found open.
+
+        Splitting on the distance between consecutive points cannot tell those
+        stretches apart from ordinary spacing on a large particle, so a missing
+        arc got bridged with a straight chord - a line drawn across the gap
+        between two particles, where there is nothing at all. The points are
+        ordered by angle about the centre, so the gap is an angular one and is
+        judged as such.
+        """
         pts = contour.reshape(-1, 2)
-        max_gap = max(6, r * 0.35)
-        segment = [pts[0]]
-        segments = []
-        for q in pts[1:]:
-            if np.hypot(q[0] - segment[-1][0], q[1] - segment[-1][1]) <= max_gap:
-                segment.append(q)
+        if len(pts) < 2:
+            return
+        cx, cy = center
+        theta = np.unwrap(np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx))
+        max_step = np.deg2rad(12)
+
+        segments, segment = [], [pts[0]]
+        for i in range(1, len(pts)):
+            if abs(theta[i] - theta[i - 1]) <= max_step:
+                segment.append(pts[i])
             else:
                 segments.append(segment)
-                segment = [q]
-        if np.hypot(pts[0][0] - segment[-1][0], pts[0][1] - segment[-1][1]) <= max_gap and segments:
+                segment = [pts[i]]
+        # Close the loop only when the outline actually comes back round.
+        wrap = abs((theta[0] + 2 * np.pi) - theta[-1])
+        if wrap <= max_step and segments:
             segments[0] = segment + segments[0]
         else:
             segments.append(segment)
+
         for seg in segments:
             if len(seg) >= 2:
                 cv2.polylines(display, [np.array(seg, np.int32).reshape(-1, 1, 2)],

@@ -344,7 +344,7 @@ class ParticleAnalyzer:
             ux, uy, rr, coverage, rms, pts = fit
             ux, uy, rr = int(round(ux)), int(round(uy)), rr
             p = self._measure_circle(ux, uy, rr, np.pi * rr * rr)
-            p["contour"] = pts.reshape(-1, 1, 2).astype(np.int32)
+            p["contour"] = pts.reshape(-1, 1, 2).astype(np.float32)
             center_inside = 4 <= ux <= w - 4 and 4 <= uy <= h - 4
 
             ring = np.linspace(0, 2 * np.pi, 96, endpoint=False)
@@ -769,7 +769,7 @@ class ParticleAnalyzer:
 
     @staticmethod
     def _regularize_trace(significant, strength, radii, index0, ok0, r0,
-                          prefer="outer", rounds=3):
+                          prefer="outer", rounds=3, band=0.18):
         """Re-pick each angle's edge near where its neighbours put theirs.
 
         ``prefer`` keeps the original selection rule - the outermost crest, or
@@ -798,6 +798,15 @@ class ParticleAnalyzer:
             else:
                 index = near.shape[1] - 1 - np.argmax(near[:, ::-1], axis=1)
             updated = ParticleAnalyzer._smooth_radii(np.where(ok, radii[index], np.nan))
+            # Local smoothness alone lets the estimate walk: a long run of
+            # angles facing the gap between particles finds the *neighbour's*
+            # rim, and each one is a small step from the last, so the reference
+            # follows them outward and the outline reaches into the gap. These
+            # are spherical particles, so hold the estimate to a band about its
+            # own median and let those angles go unmatched instead.
+            median = np.nanmedian(updated)
+            if np.isfinite(median):
+                updated = np.clip(updated, median * (1 - band), median * (1 + band))
             if np.allclose(updated, reference, equal_nan=True):
                 break
             reference = updated
@@ -851,9 +860,37 @@ class ParticleAnalyzer:
             pts = np.column_stack([cx + r_ang[good] * np.cos(angles[good]),
                                    cy + r_ang[good] * np.sin(angles[good])])
 
+        # A point more than a few percent off the fitted circle is not on this
+        # particle - in a packed field it is a neighbour's rim, found by a ray
+        # that crossed the gap between them. The MAD rejection above cannot
+        # remove those on its own: enough of them inflate the MAD that lets
+        # them stay. Dropping them here keeps the outline off the gaps.
+        #
+        # Coverage deliberately still counts the angles that had a usable edge
+        # at all: a particle pressed against its neighbours is measurable from
+        # the arc that is visible, and counting only the survivors here would
+        # push exactly those out of the results.
         resid = np.abs(np.hypot(pts[:, 0] - ux, pts[:, 1] - uy) - r)
+        tight = resid <= max(0.10 * r, 1.5)
+        if tight.sum() >= 8:
+            pts, resid = pts[tight], resid[tight]
         rms = np.sqrt(np.mean(resid ** 2)) / max(r, 1)
-        return ux, uy, r, coverage, rms, pts
+
+        # The outline that gets drawn follows the particle rather than the
+        # fitted circle - these are not perfectly round and a drawn circle
+        # visibly leaves the edge - but it is median-smoothed first. A raw
+        # trace jumps a pixel at a time between neighbouring angles, and those
+        # jumps are what read as a sawtooth once the view is scaled up.
+        theta = np.arctan2(pts[:, 1] - uy, pts[:, 0] - ux)
+        order = np.argsort(theta)
+        theta = theta[order]
+        radial = np.hypot(pts[order, 0] - ux, pts[order, 1] - uy)
+        if len(radial) >= 5:
+            stack = [np.roll(radial, k) for k in (-2, -1, 0, 1, 2)]
+            radial = np.median(stack, axis=0)
+        outline = np.column_stack([ux + radial * np.cos(theta),
+                                   uy + radial * np.sin(theta)])
+        return ux, uy, r, coverage, rms, outline
 
     @staticmethod
     def _merge_detections(primary, secondary):
