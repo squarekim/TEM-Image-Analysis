@@ -341,10 +341,11 @@ class ParticleAnalyzer:
                 cx, cy, angles, trace, score_thresh, r, outer_thresh, blurred)
             if fit is None:
                 continue
-            ux, uy, rr, coverage, rms, pts = fit
+            ux, uy, rr, coverage, rms, (pts, measured) = fit
             ux, uy, rr = int(round(ux)), int(round(uy)), rr
             p = self._measure_circle(ux, uy, rr, np.pi * rr * rr)
             p["contour"] = pts.reshape(-1, 1, 2).astype(np.float32)
+            p["contour_measured"] = measured
             center_inside = 4 <= ux <= w - 4 and 4 <= uy <= h - 4
 
             ring = np.linspace(0, 2 * np.pi, 96, endpoint=False)
@@ -876,21 +877,49 @@ class ParticleAnalyzer:
             pts, resid = pts[tight], resid[tight]
         rms = np.sqrt(np.mean(resid ** 2)) / max(r, 1)
 
-        # The outline that gets drawn follows the particle rather than the
-        # fitted circle - these are not perfectly round and a drawn circle
-        # visibly leaves the edge - but it is median-smoothed first. A raw
-        # trace jumps a pixel at a time between neighbouring angles, and those
-        # jumps are what read as a sawtooth once the view is scaled up.
+        outline, measured = ParticleAnalyzer._build_outline(ux, uy, r, pts)
+        return ux, uy, r, coverage, rms, (outline, measured)
+
+    @staticmethod
+    def _build_outline(ux, uy, r, pts, n=180):
+        """A closed outline round the particle, from the points that were found.
+
+        The outline follows the traced edge rather than the fitted circle -
+        these particles are not perfectly round, and a drawn circle visibly
+        leaves the edge - but it is drawn all the way round. Where a particle
+        is pressed against its neighbours there is no edge to find on the
+        contact side, and leaving those stretches blank drew a boundary in
+        pieces; the radius is carried across them from the arcs on either side
+        instead, which is the same thing the fitted circle does for the
+        measurement.
+        """
         theta = np.arctan2(pts[:, 1] - uy, pts[:, 0] - ux)
         order = np.argsort(theta)
-        theta = theta[order]
-        radial = np.hypot(pts[order, 0] - ux, pts[order, 1] - uy)
+        theta, radial = theta[order], np.hypot(pts[order, 0] - ux, pts[order, 1] - uy)
         if len(radial) >= 5:
-            stack = [np.roll(radial, k) for k in (-2, -1, 0, 1, 2)]
-            radial = np.median(stack, axis=0)
-        outline = np.column_stack([ux + radial * np.cos(theta),
-                                   uy + radial * np.sin(theta)])
-        return ux, uy, r, coverage, rms, outline
+            # Median over neighbouring angles: a raw trace steps a pixel at a
+            # time between them, and those steps read as a sawtooth once the
+            # view is scaled up.
+            radial = np.median([np.roll(radial, k) for k in (-2, -1, 0, 1, 2)], axis=0)
+
+        grid = np.linspace(-np.pi, np.pi, n, endpoint=False)
+        if len(theta) >= 2:
+            # np.interp is periodic once the sequence is wrapped, so gaps are
+            # bridged the short way round rather than across the whole circle.
+            wrapped_t = np.concatenate([theta - 2 * np.pi, theta, theta + 2 * np.pi])
+            wrapped_r = np.tile(radial, 3)
+            radius = np.interp(grid, wrapped_t, wrapped_r)
+            # Mark which stretches rest on a found edge and which were carried
+            # across, so the drawing can say which is which instead of
+            # presenting a guess as an observation.
+            hi = np.clip(np.searchsorted(wrapped_t, grid), 1, len(wrapped_t) - 1)
+            measured = (wrapped_t[hi] - wrapped_t[hi - 1]) <= np.deg2rad(12)
+        else:
+            radius = np.full(n, r)
+            measured = np.zeros(n, bool)
+
+        outline = np.column_stack([ux + radius * np.cos(grid), uy + radius * np.sin(grid)])
+        return outline, measured
 
     @staticmethod
     def _merge_detections(primary, secondary):

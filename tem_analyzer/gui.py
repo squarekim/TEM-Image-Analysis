@@ -789,7 +789,8 @@ class MainWindow(QMainWindow):
                 # it to whole source pixels before the upscale turns every
                 # half-pixel wobble into a `scale`-pixel staircase.
                 scaled_cnt = np.round(p["contour"].astype(np.float64) * scale).astype(np.int32)
-                self._draw_boundary(display, scaled_cnt, (cx, cy), color, thickness)
+                self._draw_boundary(display, scaled_cnt, (cx, cy), color, thickness,
+                                    p.get("contour_measured"))
             else:
                 cv2.circle(display, (cx, cy), r, color, thickness)
             if excluded:
@@ -824,38 +825,40 @@ class MainWindow(QMainWindow):
         self._display_image(display)
 
     @staticmethod
-    def _draw_boundary(display, contour, center, color, thickness):
-        """Draw the outline, leaving the stretches where no edge was found open.
+    def _draw_boundary(display, contour, center, color, thickness, measured=None):
+        """Draw the outline all the way round, thin where the edge was inferred.
 
-        Splitting on the distance between consecutive points cannot tell those
-        stretches apart from ordinary spacing on a large particle, so a missing
-        arc got bridged with a straight chord - a line drawn across the gap
-        between two particles, where there is nothing at all. The points are
-        ordered by angle about the centre, so the gap is an angular one and is
-        judged as such.
+        A particle pressed against its neighbours has no edge to find on the
+        contact side. Leaving those stretches blank drew the boundary in
+        pieces; drawing them like the rest would present a guess as an
+        observation. They are drawn thin instead, so the boundary closes and
+        still reads as measured-versus-carried-across at a glance.
         """
         pts = contour.reshape(-1, 2)
         if len(pts) < 2:
             return
-        cx, cy = center
-        theta = np.unwrap(np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx))
-        max_step = np.deg2rad(12)
+        if measured is None or len(measured) != len(pts):
+            measured = np.ones(len(pts), bool)
 
-        segments, segment = [], [pts[0]]
-        for i in range(1, len(pts)):
-            if abs(theta[i] - theta[i - 1]) <= max_step:
-                segment.append(pts[i])
+        thin = max(1, thickness - 2)
+        closed = np.vstack([pts, pts[:1]])
+        cv2.polylines(display, [closed.reshape(-1, 1, 2).astype(np.int32)],
+                      False, color, thin)
+
+        # Then lay the measured arcs over the top at full weight.
+        runs, run = [], []
+        for i, on in enumerate(measured):
+            if on:
+                run.append(pts[i])
+            elif run:
+                runs.append(run)
+                run = []
+        if run:
+            if runs and measured[0]:
+                runs[0] = run + runs[0]   # the outline wraps
             else:
-                segments.append(segment)
-                segment = [pts[i]]
-        # Close the loop only when the outline actually comes back round.
-        wrap = abs((theta[0] + 2 * np.pi) - theta[-1])
-        if wrap <= max_step and segments:
-            segments[0] = segment + segments[0]
-        else:
-            segments.append(segment)
-
-        for seg in segments:
+                runs.append(run)
+        for seg in runs:
             if len(seg) >= 2:
                 cv2.polylines(display, [np.array(seg, np.int32).reshape(-1, 1, 2)],
                               False, color, thickness)
