@@ -13,6 +13,7 @@
 import os
 import sys
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -115,9 +116,35 @@ def test_overlap_resolution():
     check("가볍게 닿은 이웃은 건드리지 않음", (c["excluded"], d["excluded"]), (False, False))
 
 
+def test_outlined_wins():
+    """Between two equally confident overlaps, the outlined one is the particle."""
+    print("\n윤곽이 있는 쪽을 남김 (빈틈의 유령 제거)")
+    size = 400
+    yy, xx = np.mgrid[0:size, 0:size]
+    img = np.full((size, size), 150.0)
+    # One real particle: bright inside, outlined by a dark ring.
+    cx, cy, r = 150, 200, 70
+    d = np.hypot(xx - cx, yy - cy)
+    img[d <= r] = 178.0
+    img[(d >= r - 6) & (d <= r)] = 96.0
+    blurred = cv2.GaussianBlur(img.astype(np.uint8), (0, 0), 1.5)
+
+    real = {"center_x": cx, "center_y": cy, "radius_px": r,
+            "approx": False, "excluded": False}
+    # A phantom overlapping it, sitting where there is nothing.
+    phantom = {"center_x": cx + 60, "center_y": cy, "radius_px": r,
+               "approx": False, "excluded": False}
+    ParticleAnalyzer._resolve_overlaps([real, phantom], blurred)
+    print(f"        링 증거: 실제 {real.get('ring_evidence', float('nan')):.2f}  "
+          f"유령 {phantom.get('ring_evidence', float('nan')):.2f}")
+    check("실제 입자 유지", real["excluded"], False)
+    check("유령 제외", phantom["excluded"], True)
+
+
 def main():
     test_overlap_fraction()
     test_overlap_resolution()
+    test_outlined_wins()
     test_no_void_detections()
     print("\n" + ("전체 통과" if not failures else f"실패: {failures}"))
     return 1 if failures else 0

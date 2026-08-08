@@ -226,7 +226,7 @@ class ParticleAnalyzer:
             particles = kept
 
         self._reject_implausible_interiors(particles, analysis_region)
-        self._resolve_overlaps(particles)
+        self._resolve_overlaps(particles, cv2.GaussianBlur(analysis_region, (0, 0), 1.5))
 
         if measure_shell:
             blur3 = cv2.GaussianBlur(analysis_region, (3, 3), 0)
@@ -849,7 +849,37 @@ class ParticleAnalyzer:
         return float(area / (np.pi * small * small))
 
     @staticmethod
-    def _resolve_overlaps(particles, thresh=0.30):
+    def _ring_evidence(blurred, cx, cy, radius, n_angles=48):
+        """Fraction of directions where a dark ring sits at the boundary.
+
+        This is what marks a particle in a micrograph whose gaps are as bright
+        as its interiors: not what is inside the circle - interiors read 131 and
+        the gaps 128 on the real images, which no interior test can separate -
+        but whether the circle is outlined. A phantom sitting in the space
+        between particles borrows pieces of its neighbours' rims and is outlined
+        over part of its circumference; a real particle is outlined all round.
+        """
+        h, w = blurred.shape
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        steps = np.arange(0.70, 1.30, 0.02)
+        votes = []
+        for a in angles:
+            xs = (cx + radius * steps * np.cos(a)).astype(int)
+            ys = (cy + radius * steps * np.sin(a)).astype(int)
+            ok = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            if ok.sum() < len(steps) * 0.8:
+                continue
+            prof = blurred[ys[ok], xs[ok]]
+            k = int(np.argmin(prof))
+            if k == 0 or k == len(prof) - 1:
+                votes.append(False)
+                continue
+            depth = min(prof[:k].max() - prof[k], prof[k:].max() - prof[k])
+            votes.append(depth >= 10)
+        return float(np.mean(votes)) if votes else 0.0
+
+    @staticmethod
+    def _resolve_overlaps(particles, blurred=None, thresh=0.30):
         """Settle detections that sit on top of one another.
 
         Particles in a packed monolayer really do overlap in projection - up to
@@ -879,6 +909,21 @@ class ParticleAnalyzer:
                     loser = p if p.get("approx") else q
                     loser["excluded"] = True
                     loser["approx"] = False
+                elif blurred is not None:
+                    # Equally confident, so ask which one is actually outlined.
+                    # Keeping both was inflating the count: a phantom in the gap
+                    # between particles can pass every test applied to it alone,
+                    # and only loses when set against the particle it overlaps.
+                    for cand in (p, q):
+                        if "ring_evidence" not in cand:
+                            cand["ring_evidence"] = ParticleAnalyzer._ring_evidence(
+                                blurred, cand["center_x"], cand["center_y"],
+                                cand["radius_px"])
+                    loser = p if p["ring_evidence"] < q["ring_evidence"] else q
+                    winner = q if loser is p else p
+                    loser["excluded"] = True
+                    loser["approx"] = False
+                    winner["overlap"] = True
                 else:
                     p["overlap"] = q["overlap"] = True
 
