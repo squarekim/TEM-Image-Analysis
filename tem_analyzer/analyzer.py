@@ -545,7 +545,17 @@ class ParticleAnalyzer:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            outside = np.nanmedian(np.where(inside[:, far], prof[:, far], np.nan), axis=1)
+            # An upper percentile, not the median: past the rim the profile is
+            # still climbing towards the surroundings, so the middle of that
+            # stretch reads low - 115 against a true 125 on the real
+            # micrographs. That drags the half-recovery target down with it and
+            # landed the boundary at 30-40% recovery when 50% was asked for, by
+            # different amounts at different magnifications. Reading the top of
+            # the stretch instead lands it at 45-47% and halves the gap between
+            # the two magnifications, without sampling further out where the
+            # neighbouring particle would be.
+            outside = np.nanpercentile(np.where(inside[:, far], prof[:, far], np.nan),
+                                       80, axis=1)
             interior = (np.nanmedian(np.where(inside[:, core], prof[:, core], np.nan), axis=1)
                         if core.any() else np.full(len(angles), np.nan))
         r_out = np.full(len(angles), np.nan)
