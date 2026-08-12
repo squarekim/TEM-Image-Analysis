@@ -516,13 +516,13 @@ class MainWindow(QMainWindow):
         param_form.addRow(self.chk_core)
 
         self.spin_edge = QSpinBox()
-        self.spin_edge.setRange(15, 85)
+        self.spin_edge.setRange(0, 100)
         self.spin_edge.setValue(int(ParticleAnalyzer.DEFAULT_EDGE_LEVEL * 100))
         self.spin_edge.setSuffix(" %")
         self.spin_edge.setToolTip(
-            "테두리가 흐릿할 때 경계를 어디로 볼지 정합니다.\n"
-            "테두리의 가장 어두운 지점(0%)에서 바깥 밝기로 회복되는 지점(100%) 사이의 위치입니다.\n"
-            "낮추면 입자가 작게, 높이면 크게 측정됩니다. 손으로 재던 값과 맞추세요.")
+            "테두리(링) 위 어디를 경계로 볼지 정합니다.\n"
+            "0% = 링의 안쪽 가장자리, 50% = 링 한가운데, 100% = 링의 바깥 가장자리.\n"
+            "외경 기준이라 기본값은 95%입니다. 손으로 재던 값과 맞추세요.")
         param_form.addRow("경계 기준:", self.spin_edge)
 
         self.chk_mark_inferred = QCheckBox("미측정 구간 가늘게 표시")

@@ -147,18 +147,19 @@ class ScaleBarDetector:
 
 
 class ParticleAnalyzer:
-    #: Where on the edge the boundary is taken, as a fraction of the way back
-    #: from the rim's extreme to the level outside it. Half is the standard
-    #: sub-pixel edge criterion, but where an edge fades over many pixels the
-    #: choice is genuinely the operator's: it is the same decision a person
-    #: makes about where to put the cursor, and it should be settable to match
-    #: how the sample has always been measured by hand.
-    DEFAULT_EDGE_LEVEL = 0.50
+    #: Where across the rim the boundary is taken: 0 at the rim's inner flank,
+    #: 0.5 on the rim itself, 1 at its outer flank, measured at half height on
+    #: each side. The outer diameter is the shell's outer edge, so the default
+    #: sits near the top - but on a rim tens of pixels wide the exact line is
+    #: genuinely the operator's call, the same decision a person makes about
+    #: where to put the cursor, and it has to be settable to match how the
+    #: sample has always been measured by hand.
+    DEFAULT_EDGE_LEVEL = 0.95
 
     def __init__(self, nm_per_px=None, edge_level=None):
         self.nm_per_px = nm_per_px
         self.edge_level = (self.DEFAULT_EDGE_LEVEL if edge_level is None
-                           else float(np.clip(edge_level, 0.15, 0.85)))
+                           else float(np.clip(edge_level, 0.0, 1.0)))
 
     def analyze(self, image, min_area_px=100, max_area_px=None,
                 circularity_thresh=0.5, use_watershed=True, hollow=False,
@@ -585,20 +586,37 @@ class ParticleAnalyzer:
             if np.isfinite(interior[i]):
                 rim_votes.append(abs(interior[i] - extreme)
                                  >= max(12.0, 0.50 * contrast))
-            target = extreme + frac * (outside[i] - extreme)
-            tail = prof[i, k:]
-            crossed = (tail >= target) if dark else (tail <= target)
-            j = int(np.argmax(crossed))
-            if not crossed[j]:
-                continue
-            # Interpolate between the two samples straddling the level.
-            idx = k + j
-            if idx > k:
-                a, b = prof[i, idx - 1], prof[i, idx]
+            # Place the boundary anywhere across the rim, not just outside it.
+            # Walking outward from the rim's darkest point can never put the
+            # edge on the rim itself, let alone on its inner flank, so the
+            # setting had almost nothing to move: 3% to 40% spanned 75 to 78 nm
+            # on a real particle whose rim is 9% of the radius wide. Measuring
+            # the half-height on both flanks gives the rim's full extent, and
+            # the setting then slides between them - 0% at the inner flank,
+            # 50% on the rim, 100% at the outer flank.
+            def half_height(level, forward):
+                target = extreme + 0.5 * (level - extreme)
+                walk = prof[i, k:] if forward else prof[i, :k + 1][::-1]
+                crossed = (walk >= target) if dark else (walk <= target)
+                j = int(np.argmax(crossed))
+                if not crossed[j]:
+                    return None
+                step = k + j if forward else k - j
+                if step == k:
+                    return radii[k]
+                prev = step - 1 if forward else step + 1
+                a, b = prof[i, prev], prof[i, step]
                 t = 0.0 if b == a else (target - a) / (b - a)
-                r_out[i] = radii[idx - 1] + t * (radii[idx] - radii[idx - 1])
-            else:
-                r_out[i] = radii[idx]
+                return radii[prev] + t * (radii[step] - radii[prev])
+
+            r_outer_edge = half_height(outside[i], True)
+            r_inner_edge = (half_height(interior[i], False)
+                            if np.isfinite(interior[i]) else None)
+            if r_outer_edge is None:
+                continue
+            if r_inner_edge is None or r_inner_edge >= r_outer_edge:
+                r_inner_edge = radii[k]
+            r_out[i] = r_inner_edge + frac * (r_outer_edge - r_inner_edge)
             s_out[i] = contrast
         rim_frac = float(np.mean(rim_votes)) if rim_votes else 0.0
         return r_out, s_out, rim_frac
