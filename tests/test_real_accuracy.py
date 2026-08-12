@@ -15,6 +15,21 @@ Three things are measured here:
               against hand measurements is worse than none.
   recall      particles actually found, estimated from the gaps left in the
               covered area that are large enough to hold another particle.
+  placement   how far the circle's centre sits from the centre of the rim it
+              is supposed to be on. Reported, not asserted: it is a known
+              defect, described below.
+
+Known defect, unresolved: about a sixth of detections are more than 10% of a
+radius out of position, and re-fitting a circle to the rim points alone puts
+the radius at 0.93 of what is reported. Both say the circle is sitting on a
+boundary made partly of this particle's rim and partly of a neighbour's.
+
+Re-centring each seed on its rim before tracing was written and reverted. It
+does help - the mis-placed fraction drops from 18% to 11-14% - but on the
+touching fixture one particle then gets found in the right place, to within a
+pixel, and thrown out by the quality gates in the classification step. Trading
+a particle that is presently measured correctly for a partial improvement is
+the wrong way round, and the gate that rejects it needs understanding first.
 """
 import os
 import sys
@@ -102,6 +117,53 @@ def fidelity(gray, valid, requested):
     return (float(np.median(achieved)) * 100 if achieved else float("nan")), len(achieved)
 
 
+def placement(gray, valid):
+    """Median distance from the circle's centre to the centre of its rim."""
+    blurred = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.5)
+    h, w = gray.shape
+    angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
+    fracs = np.arange(0.72, 1.32, 0.02)
+    shifts, radii = [], []
+    for p in valid:
+        cx, cy, r = p["center_x"], p["center_y"], p["radius_px"]
+        pts = []
+        for a in angles:
+            xs = (cx + r * fracs * np.cos(a)).astype(int)
+            ys = (cy + r * fracs * np.sin(a)).astype(int)
+            if not ((xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)).all():
+                continue
+            prof = blurred[ys, xs]
+            k = int(np.argmin(prof))
+            if k == 0 or k == len(prof) - 1:
+                continue
+            if min(prof[:k].max() - prof[k], prof[k:].max() - prof[k]) < 8:
+                continue
+            rr = r * fracs[k]
+            pts.append((cx + rr * np.cos(a), cy + rr * np.sin(a)))
+        if len(pts) < 20:
+            continue
+        P = np.array(pts)
+        ux = uy = rad = None
+        for _ in range(3):
+            A = np.column_stack([2 * P[:, 0], 2 * P[:, 1], np.ones(len(P))])
+            sol, *_ = np.linalg.lstsq(A, P[:, 0] ** 2 + P[:, 1] ** 2, rcond=None)
+            ux, uy = sol[0], sol[1]
+            rad = np.sqrt(sol[2] + ux * ux + uy * uy)
+            resid = np.abs(np.hypot(P[:, 0] - ux, P[:, 1] - uy) - rad)
+            keep = resid < 2.5 * np.median(resid) + 1
+            if keep.all():
+                break
+            P = P[keep]
+            if len(P) < 20:
+                break
+        shifts.append(np.hypot(ux - cx, uy - cy) / r)
+        radii.append(rad / r)
+    if not shifts:
+        return float("nan"), float("nan"), float("nan")
+    shifts = np.array(shifts)
+    return float(np.median(shifts)), float((shifts > 0.10).mean() * 100), float(np.median(radii))
+
+
 def check(name, ok, detail):
     print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")
     if not ok:
@@ -130,6 +192,9 @@ def main():
               f"D90 {np.percentile(d, 90):.1f} nm")
         print(f"        회수율 약 {rec:.0f}% (빈 구역 {missed}곳)   "
               f"경계 도달 {got:.0f}% (요청 {requested * 100:.0f}%, n={n})")
+        shift, off_pct, ring_r = placement(gray, valid)
+        print(f"        [미해결] 중심 어긋남 중앙 {shift * 100:.1f}% of r, "
+              f"10% 초과 {off_pct:.0f}%,  링에 다시 맞춘 반지름 {ring_r:.3f}x")
 
     print()
     means = [stats[k]["mean"] for k in stats]
