@@ -63,8 +63,11 @@ def build(path, radius, rim_frac, soft_frac, seed=3, count=12):
 
 
 def measure(path, truth):
-    particles = ParticleAnalyzer().analyze(load_image(path), min_area_px=100,
-                                           circularity_thresh=0.5, hollow=True)
+    # The fixture's truth is the outer edge of the rim, so it is scored at that
+    # convention (edge_level 0.95), independent of the product default which is
+    # tuned to the dark-ring convention of real packed hollow silica.
+    particles = ParticleAnalyzer(edge_level=0.95).analyze(
+        load_image(path), min_area_px=100, circularity_thresh=0.5, hollow=True)
     valid = [p for p in particles if not p.get("excluded")]
     errors = []
     for p in valid:

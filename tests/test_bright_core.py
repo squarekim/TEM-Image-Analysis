@@ -69,7 +69,9 @@ def main():
     print("밝은 내부 + 얇은 어두운 링 (실제 중공 실리카 구조)")
     for label, radius in (("500nm급", 35), ("200nm급", 90), ("50nm급", 200)):
         truth = generate_bright_core_image(path, radius=radius)
-        mean, std, matched = measure(path, truth)
+        # Truth here is the shell's outer edge, so score at that convention
+        # (0.95) rather than the dark-ring product default.
+        mean, std, matched = measure(path, truth, edge_level=0.95)
         known = radius == KNOWN_BAD_RADIUS
         ok = known or abs(mean) <= MAX_ERROR_PCT
         tag = "KNOWN" if known else ("PASS" if ok else "FAIL")

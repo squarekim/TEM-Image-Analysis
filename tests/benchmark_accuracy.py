@@ -41,7 +41,15 @@ def match(truth, found, tol_factor=0.6):
 
 
 def score(name, path, truth, hollow):
-    analyzer = ParticleAnalyzer()
+    # The synthetic fixtures encode the outer-edge convention: their ground
+    # truth is the outer edge of the rim, the size a person marks when the
+    # particle sits on a clear background (see generate_rimmed_image). Real
+    # densely-packed hollow silica is measured to the dark shell ring instead -
+    # there is no background outside, the neighbour is right there - which is
+    # why the product default is lower. Each is scored at its own convention:
+    # the fixtures here at the outer edge, the real images in
+    # test_real_accuracy at the default.
+    analyzer = ParticleAnalyzer(edge_level=0.95)
     particles = analyzer.analyze(load_image(path), min_area_px=100,
                                  circularity_thresh=0.5, hollow=hollow)
     valid = [p for p in particles if not p.get("excluded")]

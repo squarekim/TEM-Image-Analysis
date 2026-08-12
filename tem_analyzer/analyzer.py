@@ -154,7 +154,7 @@ class ParticleAnalyzer:
     #: genuinely the operator's call, the same decision a person makes about
     #: where to put the cursor, and it has to be settable to match how the
     #: sample has always been measured by hand.
-    DEFAULT_EDGE_LEVEL = 0.95
+    DEFAULT_EDGE_LEVEL = 0.35
 
     def __init__(self, nm_per_px=None, edge_level=None):
         self.nm_per_px = nm_per_px
