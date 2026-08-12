@@ -227,6 +227,7 @@ class ParticleAnalyzer:
 
         self._reject_implausible_interiors(particles, analysis_region)
         self._resolve_overlaps(particles, cv2.GaussianBlur(analysis_region, (0, 0), 1.5))
+        self._reject_buried(particles)
 
         if measure_shell:
             blur3 = cv2.GaussianBlur(analysis_region, (3, 3), 0)
@@ -926,6 +927,51 @@ class ParticleAnalyzer:
                     winner["overlap"] = True
                 else:
                     p["overlap"] = q["overlap"] = True
+
+    @staticmethod
+    def _reject_buried(particles, thresh=0.35):
+        """Exclude a circle whose area is mostly other particles' area.
+
+        A detection that sits in the space between particles is held up by
+        their rims rather than one of its own, and the giveaway is that most of
+        what it encloses already belongs to its neighbours. A real particle
+        occupies its own ground: on the fixtures where the truth is known, no
+        true particle is more than 13% covered by the others, while these sit
+        above 40%.
+
+        Removing one frees the area it was contributing, so the worst offender
+        goes first and the rest are re-measured, rather than condemning a group
+        that only looks buried because of each other.
+        """
+        for _ in range(len(particles)):
+            live = [p for p in particles if not p.get("excluded")]
+            if len(live) < 2:
+                return
+            worst, worst_cov = None, thresh
+            for i, p in enumerate(live):
+                cx, cy = p["center_x"], p["center_y"]
+                r = int(round(p["radius_px"]))
+                if r < 2:
+                    continue
+                size = 2 * r + 1
+                mine = np.zeros((size, size), np.uint8)
+                others = np.zeros_like(mine)
+                cv2.circle(mine, (r, r), r, 1, -1)
+                for j, q in enumerate(live):
+                    if i == j:
+                        continue
+                    qr = q["radius_px"]
+                    if np.hypot(cx - q["center_x"], cy - q["center_y"]) > r + qr:
+                        continue
+                    cv2.circle(others, (q["center_x"] - cx + r, q["center_y"] - cy + r),
+                               int(round(qr)), 1, -1)
+                covered = float(np.count_nonzero(mine & others)) / max(np.count_nonzero(mine), 1)
+                if covered > worst_cov:
+                    worst, worst_cov = p, covered
+            if worst is None:
+                return
+            worst["excluded"] = True
+            worst["approx"] = False
 
     @staticmethod
     def _reject_implausible_interiors(particles, gray, floor=20.0, k=6.0):
