@@ -8,10 +8,11 @@ test_real_images.py), so it measures grain rather than particles.
 Three things are measured here:
 
   agreement   the two images must report the same size distribution
-  fidelity    the boundary must land where "경계 기준" says it does. Asking for
-              half recovery and landing at 30% is not a small matter: it is the
-              difference between a setting an operator can calibrate against
-              hand measurements and one that merely moves things about.
+  fidelity    the boundary must land where "경계 기준" says it does - that
+              setting is a position across the rim, 0 at its inner flank and 1
+              at its outer, so the boundary is checked against the rim's own
+              half-height on both sides. A setting an operator cannot calibrate
+              against hand measurements is worse than none.
   recall      particles actually found, estimated from the gaps left in the
               covered area that are large enough to hold another particle.
 """
@@ -63,7 +64,7 @@ def recall_estimate(gray, valid):
 
 
 def fidelity(gray, valid, requested):
-    """Where the boundary actually landed, as a fraction of the rim's recovery."""
+    """Where the boundary landed across the rim: 0 = inner flank, 1 = outer."""
     blurred = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.5)
     h, w = gray.shape
     angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
@@ -80,11 +81,24 @@ def fidelity(gray, valid, requested):
                          for f in steps])
         start = int(np.argmax(steps >= 0.75))
         rim = int(np.argmin(prof[start:int(np.argmax(steps >= 1.15))])) + start
-        outside = float(np.median(prof[steps >= 1.45]))
-        if outside - prof[rim] < 15:
+        outside = float(np.percentile(prof[steps >= 1.35], 80))
+        interior = float(np.median(prof[steps <= 0.62]))
+        if outside - prof[rim] < 15 or interior - prof[rim] < 15:
             continue
-        at_boundary = float(np.interp(1.0, steps, prof))
-        achieved.append((at_boundary - prof[rim]) / (outside - prof[rim]))
+
+        def flank(level, forward):
+            target = prof[rim] + 0.5 * (level - prof[rim])
+            walk = prof[rim:] if forward else prof[:rim + 1][::-1]
+            hit = np.flatnonzero(walk >= target)
+            if not hit.size:
+                return None
+            j = int(hit[0])
+            return steps[rim + j] if forward else steps[rim - j]
+
+        outer, inner = flank(outside, True), flank(interior, False)
+        if outer is None or inner is None or outer <= inner:
+            continue
+        achieved.append((1.0 - inner) / (outer - inner))
     return (float(np.median(achieved)) * 100 if achieved else float("nan")), len(achieved)
 
 
