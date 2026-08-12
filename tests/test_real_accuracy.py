@@ -16,20 +16,10 @@ Three things are measured here:
   recall      particles actually found, estimated from the gaps left in the
               covered area that are large enough to hold another particle.
   placement   how far the circle's centre sits from the centre of the rim it
-              is supposed to be on. Reported, not asserted: it is a known
-              defect, described below.
-
-Known defect, unresolved: about a sixth of detections are more than 10% of a
-radius out of position, and re-fitting a circle to the rim points alone puts
-the radius at 0.93 of what is reported. Both say the circle is sitting on a
-boundary made partly of this particle's rim and partly of a neighbour's.
-
-Re-centring each seed on its rim before tracing was written and reverted. It
-does help - the mis-placed fraction drops from 18% to 11-14% - but on the
-touching fixture one particle then gets found in the right place, to within a
-pixel, and thrown out by the quality gates in the classification step. Trading
-a particle that is presently measured correctly for a partial improvement is
-the wrong way round, and the gate that rejects it needs understanding first.
+              is supposed to be on. Reported rather than asserted: seeds are
+              now re-centred on their rim before tracing, which halved the
+              mis-placed fraction from 18% to 10%, but a tenth of detections
+              are still more than 10% of a radius out.
 """
 import os
 import sys

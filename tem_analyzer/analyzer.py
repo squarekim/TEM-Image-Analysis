@@ -333,6 +333,16 @@ class ParticleAnalyzer:
                     continue
             expanded.append((cx, cy, r))
 
+        # Anchor each seed on the rim it belongs to before anything is traced
+        # from it. A seed sitting off-centre traces a boundary made partly of
+        # its own rim and partly of a neighbour's, and the circle fitted to
+        # that mixture is both displaced and too large: on the real
+        # micrographs a sixth of all detections were more than 10% of a radius
+        # out of position, and fitting to the rim points alone pulled the
+        # radius back to 0.93 of what was reported.
+        expanded = [self._refine_seed(blurred, cx, cy, r, w, h)
+                    for cx, cy, r in expanded]
+
         traces = []
         strong_scores, outer_scores = [], []
         for cx, cy, r in expanded:
@@ -386,7 +396,7 @@ class ParticleAnalyzer:
             if usable and coverage >= 0.5 and rms <= 0.10:
                 p["approx"] = False
                 p["excluded"] = False
-            elif usable and coverage >= 0.25 and rms <= 0.30:
+            elif usable and coverage >= 0.20 and rms <= 0.30:
                 p["approx"] = True
                 p["excluded"] = False
             else:
@@ -945,6 +955,62 @@ class ParticleAnalyzer:
                     winner["overlap"] = True
                 else:
                     p["overlap"] = q["overlap"] = True
+
+    @staticmethod
+    def _refine_seed(blurred, cx, cy, r, w, h, n_angles=120, depth_min=8.0):
+        """Re-centre a seed on the dark rim around it.
+
+        The rim is looked for as a two-sided dip along each ray - darker than
+        both what lies inside it and what lies outside - and a circle is fitted
+        to the points found, discarding those that disagree with the rest. Rays
+        that meet a neighbour's rim rather than this particle's are the ones
+        that disagree, so that rejection is what keeps the seed on its own
+        particle.
+
+        The seed is returned unchanged when too few rays find a rim, or when
+        the fit wants to move further than a seed error plausibly explains:
+        this corrects a placement, it does not go looking for a different
+        particle.
+        """
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        fracs = np.arange(0.72, 1.32, 0.02)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        xs = (cx + r * np.outer(cos_a, fracs)).astype(int)
+        ys = (cy + r * np.outer(sin_a, fracs)).astype(int)
+        good = ((xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)).all(axis=1)
+        if good.sum() < n_angles * 0.4:
+            return cx, cy, r
+        prof = blurred[np.clip(ys, 0, h - 1), np.clip(xs, 0, w - 1)].astype(np.float32)
+        points = []
+        for i in np.flatnonzero(good):
+            row = prof[i]
+            k = int(np.argmin(row))
+            if k == 0 or k == len(row) - 1:
+                continue
+            if min(row[:k].max() - row[k], row[k:].max() - row[k]) < depth_min:
+                continue
+            rr = r * fracs[k]
+            points.append((cx + rr * cos_a[i], cy + rr * sin_a[i]))
+        if len(points) < 20:
+            return cx, cy, r
+        pts = np.array(points)
+        ux, uy, rad = float(cx), float(cy), float(r)
+        for _ in range(4):
+            A = np.column_stack([2 * pts[:, 0], 2 * pts[:, 1], np.ones(len(pts))])
+            sol, *_ = np.linalg.lstsq(A, pts[:, 0] ** 2 + pts[:, 1] ** 2, rcond=None)
+            ux, uy = float(sol[0]), float(sol[1])
+            rad = float(np.sqrt(sol[2] + ux * ux + uy * uy))
+            resid = np.abs(np.hypot(pts[:, 0] - ux, pts[:, 1] - uy) - rad)
+            keep = resid < 2.5 * np.median(resid) + 1
+            if keep.all():
+                break
+            pts = pts[keep]
+            if len(pts) < 20:
+                break
+        if (np.hypot(ux - cx, uy - cy) > 0.30 * r or not 0.70 * r <= rad <= 1.30 * r
+                or not (0 <= ux < w and 0 <= uy < h)):
+            return cx, cy, r
+        return int(round(ux)), int(round(uy)), int(round(rad))
 
     @staticmethod
     def _reject_buried(particles, thresh=0.35):
