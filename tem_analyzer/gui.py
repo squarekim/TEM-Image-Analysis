@@ -515,16 +515,28 @@ class MainWindow(QMainWindow):
         self.chk_core.setToolTip("중공 입자 내부의 코어 입자를 감지하고 보유 비율을 계산")
         param_form.addRow(self.chk_core)
 
+        self.chk_edge_auto = QCheckBox("경계 자동 판단")
+        self.chk_edge_auto.setChecked(True)
+        self.chk_edge_auto.setToolTip(
+            "쉘 벽마다 바깥 지름의 위치를 따로 판단합니다 (권장).\n"
+            "이웃과 맞닿은 쪽은 두 벽이 겹쳐 보이므로 그 한가운데가 입자 표면이고,\n"
+            "빈 공간을 향한 쪽은 자기 벽 하나뿐이므로 그 바깥 끝이 표면입니다.\n"
+            "끄면 아래 값이 모든 방향에 똑같이 적용됩니다.")
+        param_form.addRow(self.chk_edge_auto)
+
         self.spin_edge = QSpinBox()
         self.spin_edge.setRange(0, 100)
         self.spin_edge.setValue(int(ParticleAnalyzer.DEFAULT_EDGE_LEVEL * 100))
         self.spin_edge.setSuffix(" %")
+        self.spin_edge.setEnabled(False)
         self.spin_edge.setToolTip(
+            "'경계 자동 판단'을 끈 경우에만 쓰입니다.\n"
             "테두리(링) 위 어디를 경계로 볼지 정합니다.\n"
             "0% = 링의 안쪽 가장자리, 50% = 링 한가운데, 100% = 링의 바깥 가장자리.\n"
-            "기본값 35%는 빽빽한 중공 실리카의 어두운 쉘 벽에 맞춰져 있습니다.\n"
-            "성긴 입자(주변에 배경이 있는 경우)는 바깥 테두리인 90~95%가 맞을 수 있습니다.\n"
+            "입자 크기는 외경이므로 기본값은 바깥 가장자리(95%)입니다.\n"
             "손으로 재던 값과 어긋나면 이 값으로 맞추세요.")
+        self.chk_edge_auto.toggled.connect(
+            lambda on: self.spin_edge.setEnabled(not on))
         param_form.addRow("경계 기준:", self.spin_edge)
 
         self.chk_mark_inferred = QCheckBox("미측정 구간 가늘게 표시")
@@ -707,8 +719,10 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
         try:
-            analyzer = ParticleAnalyzer(nm_per_px=self.nm_per_px,
-                                        edge_level=self.spin_edge.value() / 100.0)
+            analyzer = ParticleAnalyzer(
+                nm_per_px=self.nm_per_px,
+                edge_level=("auto" if self.chk_edge_auto.isChecked()
+                            else self.spin_edge.value() / 100.0))
             self.particles = analyzer.analyze(
                 self.original_image,
                 min_area_px=self.spin_min_area.value(),

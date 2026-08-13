@@ -147,18 +147,25 @@ class ScaleBarDetector:
 
 
 class ParticleAnalyzer:
-    #: Where across the rim the boundary is taken: 0 at the rim's inner flank,
-    #: 0.5 on the rim itself, 1 at its outer flank, measured at half height on
-    #: each side. The outer diameter is the shell's outer edge, so the default
-    #: sits near the top - but on a rim tens of pixels wide the exact line is
-    #: genuinely the operator's call, the same decision a person makes about
-    #: where to put the cursor, and it has to be settable to match how the
-    #: sample has always been measured by hand.
-    DEFAULT_EDGE_LEVEL = 0.35
+    #: Where across the rim the boundary is taken when the operator fixes it by
+    #: hand: 0 at the rim's inner flank, 0.5 on the rim itself, 1 at its outer
+    #: flank, measured at half height on each side. The particle size is the
+    #: outer diameter - the outside of the shell wall - so the manual default
+    #: sits at the outer flank. Left on automatic (the product default) the
+    #: analyzer picks this per ray instead; see `_outer_by_level`.
+    DEFAULT_EDGE_LEVEL = 0.95
 
-    def __init__(self, nm_per_px=None, edge_level=None):
+    #: A ray faces a touching neighbour, rather than open background, when the
+    #: level just outside the dark band is nearly the particle's own interior
+    #: level - the neighbour's interior is as bright as ours, a gap is not.
+    #: Judged as a fraction of the band's own contrast so it does not depend on
+    #: exposure or magnification.
+    CONTACT_GAP_FRAC = 0.30
+
+    def __init__(self, nm_per_px=None, edge_level="auto"):
         self.nm_per_px = nm_per_px
-        self.edge_level = (self.DEFAULT_EDGE_LEVEL if edge_level is None
+        #: None means decide per ray; a float pins every ray to that position.
+        self.edge_level = (None if edge_level is None or edge_level == "auto"
                            else float(np.clip(edge_level, 0.0, 1.0)))
 
     def analyze(self, image, min_area_px=100, max_area_px=None,
@@ -213,6 +220,18 @@ class ParticleAnalyzer:
             p.setdefault("approx", False)
         hough_particles = self._detect_hough(analysis_region, min_area_px)
         particles = self._merge_detections(hough_particles, particles)
+
+        # Shell-enclosed interiors take precedence over both ray-based paths.
+        # Rays from a centre cannot tell this particle's shell from a
+        # neighbour's when the interior and the gaps have the same brightness -
+        # the circle then rests on an envelope of several particles' walls,
+        # displaced and oversized. Enclosure can tell: a bright interior is
+        # bounded by its own shell and nothing else, so a particle found this
+        # way owns its boundary by construction. On images without bright
+        # enclosed interiors (solid particles on a bright background) the path
+        # finds nothing and changes nothing.
+        enclosed = self._detect_enclosed(analysis_region, min_area_px)
+        particles = self._merge_detections(enclosed, particles)
 
         if scalebar_rect:
             sx, sy, sw, sh = scalebar_rect
@@ -526,8 +545,7 @@ class ParticleAnalyzer:
                                               r0, outer_thresh, blurred)
         return self._select_boundary(candidate, candidate["qualifies"])
 
-    @staticmethod
-    def _outer_by_level(blurred, cx, cy, r0, angles, w, h, frac=0.5):
+    def _outer_by_level(self, blurred, cx, cy, r0, angles, w, h, frac=None):
         """Radius where the rim's darkening has faded back to the surroundings.
 
         A gradient crest is only a boundary when the edge is sharp. Where the
@@ -626,7 +644,25 @@ class ParticleAnalyzer:
                 continue
             if r_inner_edge is None or r_inner_edge >= r_outer_edge:
                 r_inner_edge = radii[k]
-            r_out[i] = r_inner_edge + frac * (r_outer_edge - r_inner_edge)
+            # Where across the band the surface lies is not one number for the
+            # whole particle. Facing an open gap the dark band is this
+            # particle's own shell wall and the surface is its outer edge.
+            # Facing a touching neighbour the band is two walls together and
+            # the surface is the contact plane, halfway across it - taking the
+            # outer edge there measures through the neighbour's wall as well
+            # and inflates the diameter by a full wall thickness. That is the
+            # difference the single global setting could not express: pushed
+            # out far enough for the free sectors it made neighbouring circles
+            # overlap by 12%, and pulled in far enough to stop that it reported
+            # the shell's inner edge.
+            if frac is None:
+                contact = (np.isfinite(interior[i])
+                           and abs(interior[i] - outside[i])
+                           < self.CONTACT_GAP_FRAC * contrast)
+                here = 0.5 if contact else 1.0
+            else:
+                here = frac
+            r_out[i] = r_inner_edge + here * (r_outer_edge - r_inner_edge)
             s_out[i] = contrast
         rim_frac = float(np.mean(rim_votes)) if rim_votes else 0.0
         return r_out, s_out, rim_frac
@@ -955,6 +991,213 @@ class ParticleAnalyzer:
                     winner["overlap"] = True
                 else:
                     p["overlap"] = q["overlap"] = True
+
+    def _detect_enclosed(self, gray, min_area_px, n_angles=180):
+        """Particles as bright interiors enclosed by their own dark shell.
+
+        The dark shell network is segmented (Otsu), and each bright region it
+        fully encloses is a candidate interior. Gap regions between packed
+        particles are also bright and also enclosed, but they are concave
+        curved triangles where an interior is a disc, so solidity and
+        circularity separate them cleanly (0.57 vs 0.9+ on the real images).
+
+        The outer boundary is then read per angle from the dark run that starts
+        at the interior's edge: on automatic, the far side of the run where it
+        is this particle's own wall and the middle of it where the run is two
+        walls pressed together, which is what makes the reported size the outer
+        diameter without measuring through the neighbour as well. A fixed
+        edge_level pins every angle to one position across the run instead,
+        exactly as it does across a traced rim.
+        """
+        blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
+        _, dark = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(cv2.bitwise_not(dark), 8)
+        h, w = gray.shape
+        dark_mask = dark > 0
+
+        # Which bright regions are open background rather than a particle's
+        # inside: the ones that run off the frame. This is what tells a shell
+        # wall from a plain edge. A wall has something of the same kind on its
+        # far side - a neighbour's interior, or a small enclosed gap - and the
+        # particle extends across it, so the boundary is the wall's far side. A
+        # solid particle's edge has open background beyond it and the particle
+        # stops where the dark starts. Brightness alone cannot tell the two
+        # apart: on the grainy fixture the background is as bright as the real
+        # micrographs' gaps, and reading its edge as a wall put every particle
+        # 13% oversize. Which region the ray lands in says it outright.
+        background = {j for j in range(1, n)
+                      if stats[j][0] <= 1 or stats[j][1] <= 1
+                      or stats[j][0] + stats[j][2] >= w - 1
+                      or stats[j][1] + stats[j][3] >= h - 1}
+
+        out = []
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        for i in range(1, n):
+            x, y, ww, hh, area = stats[i]
+            if area < max(min_area_px * 0.3, 60):
+                continue
+            if x <= 1 or y <= 1 or x + ww >= w - 1 or y + hh >= h - 1:
+                continue          # cut by the frame; the outer edge is not all there
+            comp = (labels[y:y + hh, x:x + ww] == i).astype(np.uint8)
+            cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cnt = max(cnts, key=cv2.contourArea)
+            a = cv2.contourArea(cnt)
+            if a < 40:
+                continue
+            solidity = a / max(cv2.contourArea(cv2.convexHull(cnt)), 1)
+            perim = cv2.arcLength(cnt, True)
+            circularity = 4 * np.pi * a / max(perim * perim, 1)
+            if solidity < 0.88 or circularity < 0.55:
+                continue          # a gap between particles, not an interior
+
+            m = cv2.moments(cnt)
+            cx = m["m10"] / m["m00"] + x
+            cy = m["m01"] / m["m00"] + y
+            r_in = np.sqrt(a / np.pi)
+
+            # March each ray from inside the interior out across the shell.
+            radii = np.arange(max(1.0, r_in * 0.5), r_in * 2.4, 0.5)
+            xs = np.clip((cx + np.outer(cos_a, radii)).astype(int), 0, w - 1)
+            ys = np.clip((cy + np.outer(sin_a, radii)).astype(int), 0, h - 1)
+            on_dark = dark_mask[ys, xs]
+            inner_r = np.full(n_angles, np.nan)
+            outer_r = np.full(n_angles, np.nan)
+            for j in range(n_angles):
+                run = np.flatnonzero(on_dark[j])
+                if not run.size:
+                    continue
+                k0 = run[0]
+                # end of the first dark run, tolerating single-pixel speckle
+                k1 = k0
+                while k1 + 1 < len(radii) and (on_dark[j, k1 + 1]
+                                               or (k1 + 2 < len(radii) and on_dark[j, k1 + 2])):
+                    k1 += 1
+                # A dark run that reaches the end of the search never found the
+                # shell's outer edge: it is background, not a wall. On a solid
+                # bright disc on a dark ground every ray is like this, and
+                # accepting it would draw a circle out at the search limit. Such
+                # rays are left unmeasured, so the detector simply finds nothing
+                # there and the ray-based path handles the image instead.
+                if k1 >= len(radii) - 1:
+                    continue
+                # Leaving a wall means arriving somewhere - a gap or the
+                # neighbour's interior - and staying there. On a noisy image
+                # whose "wall" is really the background, two bright specks in a
+                # row end the run just as convincingly, and the boundary then
+                # lands wherever the noise happened to clear: the grainy
+                # fixture came out 13% oversized that way. Requiring the
+                # brightness to hold past the exit costs nothing on a genuine
+                # wall and gives those rays no reading at all, which drops the
+                # particle back to the ray-based path that handles it well.
+                beyond = on_dark[j, k1 + 1:k1 + 9]
+                if beyond.size < 4 or beyond.mean() > 0.25:
+                    continue
+                # What the ray lands in has to be a region in its own right - a
+                # neighbour's interior or an enclosed gap - and not the open
+                # background. In a noisy image the far side of a supposed wall
+                # is a scatter of bright specks a few pixels across, which is
+                # neither, and those rays are what dragged the grainy fixture
+                # oversize even after the sustained-brightness check.
+                beyond_label = labels[ys[j, min(k1 + 4, len(radii) - 1)],
+                                      xs[j, min(k1 + 4, len(radii) - 1)]]
+                if beyond_label in background or beyond_label == 0:
+                    continue
+                if stats[beyond_label][4] < max(60.0, 0.03 * area):
+                    continue
+                inner_r[j] = radii[k0]
+                outer_r[j] = radii[k1]
+
+            thickness = outer_r - inner_r
+            good = np.isfinite(thickness)
+            if good.sum() < n_angles * 0.4:
+                continue
+
+            # A shell is bright on both sides: the interior it encloses, and
+            # the gap or neighbour beyond it. On a solid bright disc on a dark
+            # ground the "shell" is the background, dark all the way out, and
+            # noise gives it a scatter of false exits - so the level just past
+            # the run is dark, well below the interior. That is how this path
+            # knows not to fire on an image the ray-based path already handles.
+            interior_level = float(blur[np.clip(int(cy), 0, h - 1),
+                                        np.clip(int(cx), 0, w - 1)])
+            past = np.clip(np.nan_to_num(outer_r + 3, nan=0.0), 0, radii[-1])
+            gx = np.clip((cx + past * cos_a).astype(int), 0, w - 1)
+            gy = np.clip((cy + past * sin_a).astype(int), 0, h - 1)
+            outside_level = float(np.nanmedian(np.where(good, blur[gy, gx], np.nan)))
+            interior_disc = float(np.median(blur[
+                np.clip((cy + 0.4 * r_in * sin_a).astype(int), 0, h - 1),
+                np.clip((cx + 0.4 * r_in * cos_a).astype(int), 0, w - 1)]))
+            if outside_level < interior_disc - 30:
+                continue
+
+            med_t = float(np.nanmedian(thickness[good]))
+            # Shared walls read as runs far longer than the particle's own
+            # shell; the outer edge there belongs to the pair, not to us.
+            good &= thickness <= max(med_t * 2.0, med_t + 3.0)
+            if good.sum() < 12:
+                continue
+
+            # Same per-ray reading as the traced path: a run of ordinary
+            # thickness is this particle's own wall and the surface is its far
+            # side, while a noticeably thicker run is two walls pressed
+            # together and the surface is the contact plane in the middle.
+            if self.edge_level is None:
+                frac = np.where(thickness > med_t * 1.4, 0.5, 1.0)
+            else:
+                frac = self.edge_level
+            level_r = inner_r + frac * (outer_r - inner_r)
+            pts = np.column_stack([cx + level_r[good] * cos_a[good],
+                                   cy + level_r[good] * sin_a[good]])
+            ux, uy, rad = float(cx), float(cy), float(np.nanmedian(level_r[good]))
+            keep = pts
+            for _ in range(3):
+                A = np.column_stack([2 * keep[:, 0], 2 * keep[:, 1], np.ones(len(keep))])
+                sol, *_ = np.linalg.lstsq(A, keep[:, 0] ** 2 + keep[:, 1] ** 2, rcond=None)
+                ux, uy = float(sol[0]), float(sol[1])
+                rad = float(np.sqrt(sol[2] + ux * ux + uy * uy))
+                resid = np.abs(np.hypot(keep[:, 0] - ux, keep[:, 1] - uy) - rad)
+                ok = resid < 2.5 * np.median(resid) + 1
+                if ok.all():
+                    break
+                keep = keep[ok]
+                if len(keep) < 12:
+                    break
+            if not (r_in * 0.8 <= rad <= r_in * 2.2):
+                continue
+            if np.pi * rad * rad < min_area_px:
+                continue
+
+            resid = np.abs(np.hypot(keep[:, 0] - ux, keep[:, 1] - uy) - rad)
+            rms = float(np.sqrt(np.mean(resid ** 2)) / max(rad, 1))
+            coverage = float(good.mean())
+
+            p = self._measure_circle(int(round(ux)), int(round(uy)), rad,
+                                     np.pi * rad * rad)
+            outline, measured = self._build_outline(ux, uy, rad, keep)
+            p["contour"] = outline.reshape(-1, 1, 2).astype(np.float32)
+            p["contour_measured"] = measured
+            p["coverage"] = coverage
+            # Stricter than the traced path's 0.20, and for a reason particular
+            # to this one. A shell surrounds its particle, so where the wall is
+            # genuinely a wall it is found nearly all the way round - three
+            # quarters of the rays on the real micrographs. A gap between two
+            # solid particles that merely happen to sit close reads the same on
+            # the few rays that point at a neighbour and nowhere else, which is
+            # exactly the grainy fixture: a nearly-touching grid whose widest
+            # agreement is 0.59. Asking for most of the circumference keeps the
+            # walls and drops the coincidences; the particles this turns away
+            # are still found by the traced path, just measured its way.
+            # The residual bound is tighter than the traced path's too. This
+            # path overrides a measurement the traced path already made, so a
+            # ragged fit here replaces a good number with a worse one: on the
+            # bright-core fixture the loose bound let marginal arcs through and
+            # tripled the spread. Where the arcs disagree, the traced path
+            # keeps the particle.
+            p["excluded"] = not (coverage >= 0.60 and rms <= 0.12)
+            p["approx"] = (not p["excluded"]) and not (coverage >= 0.75 and rms <= 0.08)
+            out.append(p)
+        return out
 
     @staticmethod
     def _refine_seed(blurred, cx, cy, r, w, h, n_angles=120, depth_min=8.0):
