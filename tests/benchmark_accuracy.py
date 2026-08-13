@@ -50,9 +50,17 @@ def score(name, path, truth, hollow):
     # the fixtures here at the outer edge, the real images in
     # test_real_accuracy at the default.
     analyzer = ParticleAnalyzer(edge_level=0.95)
-    particles = analyzer.analyze(load_image(path), min_area_px=100,
+    image = load_image(path)
+    particles = analyzer.analyze(image, min_area_px=100,
                                  circularity_thresh=0.5, hollow=hollow)
     valid = [p for p in particles if not p.get("excluded")]
+    # A particle the frame cuts through has no determinable diameter, so the
+    # analyzer excludes it by design. Scoring it as a miss would mark the
+    # analyzer down for obeying its own contract, and would reward a version
+    # that reported an extrapolated size instead.
+    h, w = image.shape[:2]
+    truth = [(x, y, r) for x, y, r in truth
+             if x - r >= 0 and y - r >= 0 and x + r <= w and y + r <= h]
     pairs, spurious = match(truth, valid)
     if not pairs:
         print(f"{name}: no matches")

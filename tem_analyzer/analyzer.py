@@ -246,6 +246,7 @@ class ParticleAnalyzer:
             particles = kept
 
         self._reject_implausible_interiors(particles, analysis_region)
+        self._reject_clipped(particles, analysis_region.shape)
         self._resolve_overlaps(particles, cv2.GaussianBlur(analysis_region, (0, 0), 1.5))
         self._reject_buried(particles)
 
@@ -1030,15 +1031,20 @@ class ParticleAnalyzer:
                       or stats[j][0] + stats[j][2] >= w - 1
                       or stats[j][1] + stats[j][3] >= h - 1}
 
-        out = []
-        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
-        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        # Which bright regions are particle interiors is settled before any ray
+        # is cast, because a ray needs the answer about the region it lands in,
+        # not just the one it started from. Whether a wall is shared is then a
+        # fact rather than a guess: the far side is another interior, or it is
+        # not. Judging it by the run being thicker than usual - the obvious
+        # heuristic - misses every pair whose walls sit close enough to read as
+        # one ordinary run, and those are exactly the crowded neighbours where
+        # being wrong costs a full wall thickness. A third of the circles on
+        # the real micrographs came out that much too large.
+        interiors = {}
         for i in range(1, n):
             x, y, ww, hh, area = stats[i]
             if area < max(min_area_px * 0.3, 60):
                 continue
-            if x <= 1 or y <= 1 or x + ww >= w - 1 or y + hh >= h - 1:
-                continue          # cut by the frame; the outer edge is not all there
             comp = (labels[y:y + hh, x:x + ww] == i).astype(np.uint8)
             cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cnt = max(cnts, key=cv2.contourArea)
@@ -1050,7 +1056,16 @@ class ParticleAnalyzer:
             circularity = 4 * np.pi * a / max(perim * perim, 1)
             if solidity < 0.88 or circularity < 0.55:
                 continue          # a gap between particles, not an interior
+            interiors[i] = cnt
 
+        out = []
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        for i, cnt in interiors.items():
+            x, y, ww, hh, area = stats[i]
+            if x <= 1 or y <= 1 or x + ww >= w - 1 or y + hh >= h - 1:
+                continue          # cut by the frame; the outer edge is not all there
+            a = cv2.contourArea(cnt)
             m = cv2.moments(cnt)
             cx = m["m10"] / m["m00"] + x
             cy = m["m01"] / m["m00"] + y
@@ -1063,6 +1078,7 @@ class ParticleAnalyzer:
             on_dark = dark_mask[ys, xs]
             inner_r = np.full(n_angles, np.nan)
             outer_r = np.full(n_angles, np.nan)
+            shared = np.zeros(n_angles, bool)
             for j in range(n_angles):
                 run = np.flatnonzero(on_dark[j])
                 if not run.size:
@@ -1107,6 +1123,7 @@ class ParticleAnalyzer:
                     continue
                 inner_r[j] = radii[k0]
                 outer_r[j] = radii[k1]
+                shared[j] = beyond_label in interiors
 
             thickness = outer_r - inner_r
             good = np.isfinite(thickness)
@@ -1132,18 +1149,19 @@ class ParticleAnalyzer:
                 continue
 
             med_t = float(np.nanmedian(thickness[good]))
-            # Shared walls read as runs far longer than the particle's own
-            # shell; the outer edge there belongs to the pair, not to us.
+            # A run several times the usual thickness is not one wall seen
+            # edge-on but a pile the ray never got out of; there is no surface
+            # to read in it either way.
             good &= thickness <= max(med_t * 2.0, med_t + 3.0)
             if good.sum() < 12:
                 continue
 
-            # Same per-ray reading as the traced path: a run of ordinary
-            # thickness is this particle's own wall and the surface is its far
-            # side, while a noticeably thicker run is two walls pressed
-            # together and the surface is the contact plane in the middle.
+            # The surface, per ray. Where the far side of the run is another
+            # particle's interior the run is two walls together and the surface
+            # is the contact plane halfway across; where it is a gap the run is
+            # this particle's own wall and the surface is its far edge.
             if self.edge_level is None:
-                frac = np.where(thickness > med_t * 1.4, 0.5, 1.0)
+                frac = np.where(shared, 0.5, 1.0)
             else:
                 frac = self.edge_level
             level_r = inner_r + frac * (outer_r - inner_r)
@@ -1165,6 +1183,21 @@ class ParticleAnalyzer:
                     break
             if not (r_in * 0.8 <= rad <= r_in * 2.2):
                 continue
+            # The free fit is allowed to move the centre, but not to leave the
+            # interior it was found from. A particle whose neighbours crowd one
+            # side and whose other side faces gaps gets its wall read more
+            # confidently on the open side, and the fit slides that way - the
+            # circle keeps the right size but sits off the particle, bulging
+            # past it on one edge, which is what reads as "too big" even though
+            # the radius is right. The enclosed interior's own centroid has no
+            # such lean: it is the region's centre of area, and every ray was
+            # cast from it. When the fit disagrees with it by more than a
+            # sixth of a radius, the fit is the thing that moved.
+            if np.hypot(ux - cx, uy - cy) > 0.16 * rad:
+                ux, uy = float(cx), float(cy)
+                rad = float(np.nanmedian(level_r[good]))
+                keep = np.column_stack([cx + level_r[good] * cos_a[good],
+                                        cy + level_r[good] * sin_a[good]])
             if np.pi * rad * rad < min_area_px:
                 continue
 
@@ -1254,6 +1287,28 @@ class ParticleAnalyzer:
                 or not (0 <= ux < w and 0 <= uy < h)):
             return cx, cy, r
         return int(round(ux)), int(round(uy)), int(round(rad))
+
+    @staticmethod
+    def _reject_clipped(particles, shape):
+        """Exclude particles the frame cuts through.
+
+        Half a boundary cannot fix a diameter: what is measured is the visible
+        arc, and the circle through it is an extrapolation the image does not
+        support. Those circles sit noticeably off their particle and bulge past
+        it, which is what a reader sees as "the circle is bigger than the
+        particle" - they were a sixth of the detections on the real
+        micrographs. Excluding them is what the documentation has always said
+        happens; it was simply never implemented.
+        """
+        h, w = shape[:2]
+        for p in particles:
+            if p.get("excluded"):
+                continue
+            cx, cy, r = p["center_x"], p["center_y"], p["radius_px"]
+            if cx - r < 0 or cy - r < 0 or cx + r > w or cy + r > h:
+                p["excluded"] = True
+                p["approx"] = False
+                p["clipped"] = True
 
     @staticmethod
     def _reject_buried(particles, thresh=0.35):
