@@ -546,6 +546,31 @@ class ParticleAnalyzer:
                                               r0, outer_thresh, blurred)
         return self._select_boundary(candidate, candidate["qualifies"])
 
+    @staticmethod
+    def _row_percentile(a, q):
+        """``np.nanpercentile(a, q, axis=1)``, without the per-row Python loop.
+
+        numpy reduces along an axis by calling the 1-D routine once per row
+        through ``apply_along_axis``. At 180 rays per particle and hundreds of
+        particles that is tens of thousands of calls, and it was the single
+        largest cost in a full-image analysis - a third of the total. Sorting
+        the whole array at once puts NaNs at the end of each row by definition,
+        so the valid count per row is all that is needed to index the same
+        value numpy would have interpolated.
+        """
+        a = np.sort(a, axis=1)
+        counts = np.count_nonzero(~np.isnan(a), axis=1)
+        out = np.full(len(a), np.nan)
+        rows = np.flatnonzero(counts > 0)
+        if not rows.size:
+            return out
+        pos = (counts[rows] - 1) * (q / 100.0)
+        lo = np.floor(pos).astype(np.intp)
+        hi = np.ceil(pos).astype(np.intp)
+        w = pos - lo
+        out[rows] = a[rows, lo] * (1.0 - w) + a[rows, hi] * w
+        return out
+
     def _outer_by_level(self, blurred, cx, cy, r0, angles, w, h, frac=None):
         """Radius where the rim's darkening has faded back to the surroundings.
 
@@ -585,10 +610,11 @@ class ParticleAnalyzer:
             # the stretch instead lands it at 45-47% and halves the gap between
             # the two magnifications, without sampling further out where the
             # neighbouring particle would be.
-            outside = np.nanpercentile(np.where(inside[:, far], prof[:, far], np.nan),
-                                       80, axis=1)
-            interior = (np.nanmedian(np.where(inside[:, core], prof[:, core], np.nan), axis=1)
-                        if core.any() else np.full(len(angles), np.nan))
+            outside = self._row_percentile(
+                np.where(inside[:, far], prof[:, far], np.nan), 80.0)
+            interior = (self._row_percentile(
+                np.where(inside[:, core], prof[:, core], np.nan), 50.0)
+                if core.any() else np.full(len(angles), np.nan))
         r_out = np.full(len(angles), np.nan)
         s_out = np.zeros(len(angles))
         band_idx = np.flatnonzero(band)
@@ -1086,54 +1112,71 @@ class ParticleAnalyzer:
             xs = np.clip((cx + np.outer(cos_a, radii)).astype(int), 0, w - 1)
             ys = np.clip((cy + np.outer(sin_a, radii)).astype(int), 0, h - 1)
             on_dark = dark_mask[ys, xs]
-            inner_r = np.full(n_angles, np.nan)
-            outer_r = np.full(n_angles, np.nan)
+            # Every ray at once. The march is a scan for one run of dark per
+            # ray with a handful of conditions on it, and doing that a ray at a
+            # time in Python cost more than the rest of the detector put
+            # together on a full field.
+            n_r = len(radii)
+            has_dark = on_dark.any(axis=1)
+            k0 = np.argmax(on_dark, axis=1)
+
+            # The run ends at the first step whose next two samples are both
+            # bright - one bright sample is speckle, not the far side of a
+            # wall. Running out of samples ends it too.
+            stop = np.ones_like(on_dark)
+            stop[:, :n_r - 1] = ~on_dark[:, 1:]
+            stop[:, :n_r - 2] &= ~on_dark[:, 2:]
+            reach = np.arange(n_r)[None, :] >= k0[:, None]
+            k1 = np.argmax(stop & reach, axis=1)
+
+            # A dark run that reaches the end of the search never found the
+            # shell's outer edge: it is background, not a wall. On a solid
+            # bright disc on a dark ground every ray is like this, and
+            # accepting it would draw a circle out at the search limit. Such
+            # rays are left unmeasured, so the detector simply finds nothing
+            # there and the ray-based path handles the image instead.
+            live = has_dark & (stop & reach).any(axis=1) & (k1 < n_r - 1)
+
+            # Leaving a wall means arriving somewhere - a gap or the
+            # neighbour's interior - and staying there. On a noisy image whose
+            # "wall" is really the background, two bright specks in a row end
+            # the run just as convincingly, and the boundary then lands
+            # wherever the noise happened to clear: the grainy fixture came out
+            # 13% oversized that way. Requiring the brightness to hold past the
+            # exit costs nothing on a genuine wall and gives those rays no
+            # reading at all, which drops the particle back to the ray-based
+            # path that handles it well.
+            off = np.arange(1, 9)[None, :]
+            pos = k1[:, None] + off
+            inside_r = pos < n_r
+            past = np.take_along_axis(on_dark, np.clip(pos, 0, n_r - 1), axis=1)
+            n_past = inside_r.sum(axis=1)
+            with np.errstate(invalid="ignore"):
+                past_dark = np.where(inside_r, past, 0).sum(axis=1) / np.maximum(n_past, 1)
+            live &= (n_past >= 4) & (past_dark <= 0.25)
+
+            # What the ray lands in has to be a region in its own right - a
+            # neighbour's interior or an enclosed gap - and not the open
+            # background. In a noisy image the far side of a supposed wall is a
+            # scatter of bright specks a few pixels across, which is neither,
+            # and those rays are what dragged the grainy fixture oversize even
+            # after the sustained-brightness check.
+            probe = np.minimum(k1 + 4, n_r - 1)
+            beyond_label = labels[ys[np.arange(n_angles), probe],
+                                  xs[np.arange(n_angles), probe]]
+            area_ok = np.zeros(n_angles, bool)
             shared = np.zeros(n_angles, bool)
-            for j in range(n_angles):
-                run = np.flatnonzero(on_dark[j])
-                if not run.size:
+            floor = max(60.0, 0.03 * area)
+            for j in np.flatnonzero(live):
+                lab = beyond_label[j]
+                if lab == 0 or lab in background or stats[lab][4] < floor:
                     continue
-                k0 = run[0]
-                # end of the first dark run, tolerating single-pixel speckle
-                k1 = k0
-                while k1 + 1 < len(radii) and (on_dark[j, k1 + 1]
-                                               or (k1 + 2 < len(radii) and on_dark[j, k1 + 2])):
-                    k1 += 1
-                # A dark run that reaches the end of the search never found the
-                # shell's outer edge: it is background, not a wall. On a solid
-                # bright disc on a dark ground every ray is like this, and
-                # accepting it would draw a circle out at the search limit. Such
-                # rays are left unmeasured, so the detector simply finds nothing
-                # there and the ray-based path handles the image instead.
-                if k1 >= len(radii) - 1:
-                    continue
-                # Leaving a wall means arriving somewhere - a gap or the
-                # neighbour's interior - and staying there. On a noisy image
-                # whose "wall" is really the background, two bright specks in a
-                # row end the run just as convincingly, and the boundary then
-                # lands wherever the noise happened to clear: the grainy
-                # fixture came out 13% oversized that way. Requiring the
-                # brightness to hold past the exit costs nothing on a genuine
-                # wall and gives those rays no reading at all, which drops the
-                # particle back to the ray-based path that handles it well.
-                beyond = on_dark[j, k1 + 1:k1 + 9]
-                if beyond.size < 4 or beyond.mean() > 0.25:
-                    continue
-                # What the ray lands in has to be a region in its own right - a
-                # neighbour's interior or an enclosed gap - and not the open
-                # background. In a noisy image the far side of a supposed wall
-                # is a scatter of bright specks a few pixels across, which is
-                # neither, and those rays are what dragged the grainy fixture
-                # oversize even after the sustained-brightness check.
-                beyond_label = labels[ys[j, min(k1 + 4, len(radii) - 1)],
-                                      xs[j, min(k1 + 4, len(radii) - 1)]]
-                if beyond_label in background or beyond_label == 0:
-                    continue
-                if stats[beyond_label][4] < max(60.0, 0.03 * area):
-                    continue
-                inner_r[j] = radii[k0]
-                outer_r[j] = radii[k1]
-                shared[j] = beyond_label in interiors
+                area_ok[j] = True
+                shared[j] = lab in interiors
+            live &= area_ok
+
+            inner_r = np.where(live, radii[k0], np.nan)
+            outer_r = np.where(live, radii[k1], np.nan)
 
             thickness = outer_r - inner_r
             good = np.isfinite(thickness)
@@ -1356,36 +1399,54 @@ class ParticleAnalyzer:
         Removing one frees the area it was contributing, so the worst offender
         goes first and the rest are re-measured, rather than condemning a group
         that only looks buried because of each other.
+
+        Only the neighbours of the one just removed can have changed, though -
+        a circle's coverage depends on nothing else - so the rest keep their
+        measurement instead of the whole field being rasterised again on every
+        round.
         """
-        for _ in range(len(particles)):
-            live = [p for p in particles if not p.get("excluded")]
-            if len(live) < 2:
-                return
-            worst, worst_cov = None, thresh
-            for i, p in enumerate(live):
-                cx, cy = p["center_x"], p["center_y"]
-                r = int(round(p["radius_px"]))
-                if r < 2:
+        live = [p for p in particles if not p.get("excluded")]
+        if len(live) < 2:
+            return
+        centres = np.array([[p["center_x"], p["center_y"]] for p in live], float)
+        radii = np.array([p["radius_px"] for p in live], float)
+        gap = (np.hypot(centres[:, None, 0] - centres[None, :, 0],
+                        centres[:, None, 1] - centres[None, :, 1])
+               - radii[:, None] - radii[None, :])
+        np.fill_diagonal(gap, 1.0)
+        neighbours = [np.flatnonzero(row <= 0) for row in gap]
+        dropped = np.zeros(len(live), bool)
+
+        def coverage(i):
+            p = live[i]
+            r = int(round(p["radius_px"]))
+            if r < 2:
+                return 0.0
+            cx, cy = p["center_x"], p["center_y"]
+            size = 2 * r + 1
+            mine = np.zeros((size, size), np.uint8)
+            others = np.zeros_like(mine)
+            cv2.circle(mine, (r, r), r, 1, -1)
+            for j in neighbours[i]:
+                if dropped[j]:
                     continue
-                size = 2 * r + 1
-                mine = np.zeros((size, size), np.uint8)
-                others = np.zeros_like(mine)
-                cv2.circle(mine, (r, r), r, 1, -1)
-                for j, q in enumerate(live):
-                    if i == j:
-                        continue
-                    qr = q["radius_px"]
-                    if np.hypot(cx - q["center_x"], cy - q["center_y"]) > r + qr:
-                        continue
-                    cv2.circle(others, (q["center_x"] - cx + r, q["center_y"] - cy + r),
-                               int(round(qr)), 1, -1)
-                covered = float(np.count_nonzero(mine & others)) / max(np.count_nonzero(mine), 1)
-                if covered > worst_cov:
-                    worst, worst_cov = p, covered
-            if worst is None:
+                q = live[j]
+                cv2.circle(others, (q["center_x"] - cx + r, q["center_y"] - cy + r),
+                           int(round(q["radius_px"])), 1, -1)
+            return float(np.count_nonzero(mine & others)) / max(np.count_nonzero(mine), 1)
+
+        covered = np.array([coverage(i) for i in range(len(live))])
+        while True:
+            covered[dropped] = 0.0
+            i = int(np.argmax(covered))
+            if covered[i] <= thresh:
                 return
-            worst["excluded"] = True
-            worst["approx"] = False
+            dropped[i] = True
+            live[i]["excluded"] = True
+            live[i]["approx"] = False
+            for j in neighbours[i]:
+                if not dropped[j]:
+                    covered[j] = coverage(j)
 
     @staticmethod
     def _reject_implausible_interiors(particles, gray, floor=20.0, k=6.0):
@@ -1614,31 +1675,40 @@ class ParticleAnalyzer:
         merged = [p for p in primary if not p.get("excluded")]
         rejected = [p for p in primary if p.get("excluded")]
 
+        # A candidate can clash with one accepted before it, so the additions
+        # stay sequential - but each candidate is tested against everything
+        # kept so far in one comparison rather than a Python loop over it.
+        xs = [p["center_x"] for p in merged]
+        ys = [p["center_y"] for p in merged]
+        rs = [p["radius_px"] for p in merged]
+        cx = np.array(xs, float)
+        cy = np.array(ys, float)
+        cr = np.array(rs, float)
         for cand in secondary:
             if cand.get("excluded"):
                 continue
-            clash = False
-            for kept in merged:
-                d = np.hypot(cand["center_x"] - kept["center_x"],
-                             cand["center_y"] - kept["center_y"])
-                if d < 0.8 * max(cand["radius_px"], kept["radius_px"]):
-                    clash = True
-                    break
-            if not clash:
-                merged.append(cand)
+            x, y, r = cand["center_x"], cand["center_y"], cand["radius_px"]
+            if cx.size:
+                d = np.hypot(cx - x, cy - y)
+                if (d < 0.8 * np.maximum(cr, r)).any():
+                    continue
+            merged.append(cand)
+            cx = np.append(cx, x)
+            cy = np.append(cy, y)
+            cr = np.append(cr, r)
 
         # A circle that swallows two accepted centres is a fused pair, not a
         # particle, whichever detector produced it.
         keep = []
-        for p in merged:
-            inside = sum(
-                1
-                for q in merged
-                if q is not p
-                and np.hypot(p["center_x"] - q["center_x"],
-                             p["center_y"] - q["center_y"]) < p["radius_px"]
-            )
-            if inside >= 2:
+        if merged:
+            near = (np.hypot(cx[:, None] - cx[None, :], cy[:, None] - cy[None, :])
+                    < cr[:, None])
+            np.fill_diagonal(near, False)
+            inside = near.sum(axis=1)
+        else:
+            inside = np.zeros(0, int)
+        for p, n in zip(merged, inside):
+            if n >= 2:
                 p["excluded"] = True
                 p["approx"] = False
                 rejected.append(p)

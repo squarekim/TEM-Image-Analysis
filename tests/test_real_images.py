@@ -1,16 +1,27 @@
-"""Measure the same specimen photographed at three magnifications.
+"""Measure real micrographs at three magnifications.
 
-These are real micrographs of the sample this program exists for. The specimen
-does not change between them, so the three must report the same particle size;
-any disagreement is the program's, and it needs no ground truth to detect.
+These are real micrographs of the sample this program exists for, and they are
+the only images here whose particles were not drawn by a generator.
+
+They are NOT the same specimen. This file used to assert that the three had to
+report the same size, on the assumption that only the magnification differed;
+the person who supplied them has since said otherwise. So sizes agreeing across
+these three is not evidence of accuracy, and sizes disagreeing is not evidence
+of a fault - the specimens genuinely differ. Do not reintroduce that assertion
+without a pair of images confirmed to be one specimen. What these images are
+good for is everything that does not depend on the sample: the scale bar being
+read, particles being found at all, and the run not falling over.
 
 The scale bar is read from each image, so the comparison is in nanometres.
 
-Result: the 200 nm and 500 nm images agree to within 3%. The 50 nm image does
-not, and the reason is upstream of anything to do with boundaries:
-_estimate_radius picks 21.7 px for particles whose radius is about 185 px, so
-the seed search runs over the wrong size range entirely and returns hundreds of
-grain speckles instead of the eight particles that are there.
+Result: the 200 nm and 500 nm images report sizes within 3% of each other,
+which given the above is a coincidence worth printing and nothing to lean on.
+
+The 50 nm image is separately and definitely wrong, for a reason that needs no
+comparison with anything: _estimate_radius picks 21.7 px for particles whose
+radius is about 185 px, so the seed search runs over the wrong size range
+entirely and returns hundreds of grain speckles instead of the eight particles
+that are there.
 
 The cause is in the band score, which is the validated fraction multiplied by
 the *number* of circles the band found. Small circles are always the more
@@ -36,7 +47,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 IMAGES = [("50nm", "tem_50nm.jpg", 50.0), ("200nm", "tem_200nm.jpg", 200.0),
           ("500nm", "tem_500nm.jpg", 500.0)]
 KNOWN_BAD = "50nm"
-MAX_SPREAD_PCT = 10.0
 
 
 def scale_bar_px(gray):
@@ -56,7 +66,7 @@ def scale_bar_px(gray):
 
 def main():
     results = {}
-    print("같은 시료, 배율만 다름 - 셋의 직경이 일치해야 함")
+    print("실제 미크로그래프 3장 (서로 다른 시료 - 직경 비교는 참고용)")
     for label, filename, bar_nm in IMAGES:
         path = os.path.join(HERE, "real", filename)
         if not os.path.exists(path):
@@ -88,15 +98,18 @@ def main():
     if len(agreeing) >= 2:
         values = np.array(list(agreeing.values()))
         spread = (values.max() - values.min()) / values.mean() * 100
-        ok = spread <= MAX_SPREAD_PCT
-        print(f"\n  {'PASS' if ok else 'FAIL'}  {' / '.join(agreeing)} 일치도: "
-              f"{spread:.1f}% 차이 (허용 {MAX_SPREAD_PCT:.0f}%)")
-        if not ok:
-            failures.append(f"배율 간 {spread:.1f}% 차이")
+        # Printed, never asserted: these are different specimens, so the two
+        # sizes have no reason to match and matching proves nothing.
+        print(f"\n  참고  {' / '.join(agreeing)} 직경 차이 {spread:.1f}% "
+              "(서로 다른 시료이므로 판정 기준 아님)")
 
-    if KNOWN_BAD in results and agreeing:
-        off = (results[KNOWN_BAD] / np.mean(list(agreeing.values())) - 1) * 100
-        print(f"  KNOWN {KNOWN_BAD}: {off:+.0f}% 어긋남 - 미해결. "
+    if KNOWN_BAD in results:
+        # Stated against this image alone, not against the others: the failure
+        # is that _estimate_radius picks a 21.7 px seed size for particles
+        # whose radius is about 185 px, so what gets measured is grain. No
+        # comparison with another specimen is needed to see that.
+        print(f"  KNOWN {KNOWN_BAD}: 직경 {results[KNOWN_BAD]:.1f} nm - 미해결. "
+              "씨앗 크기 추정이 실제 입자의 1/6을 고르는 탓에 "
               "입자가 아니라 이미지 그레인을 세고 있음 (파일 상단 설명 참조)")
 
     print("\n" + ("통과 (미해결 항목 제외)" if not failures else "실패: " + "; ".join(failures)))

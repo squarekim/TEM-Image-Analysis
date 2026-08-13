@@ -1,17 +1,19 @@
 """Accuracy on the real 200 nm and 500 nm micrographs, in detail.
 
-These two images are the same specimen at different magnifications, so they
-must agree with each other, and that check needs no ground truth. The 50 nm
-image is excluded: its size-scale estimate fails outright (see
-test_real_images.py), so it measures grain rather than particles.
+These are two different specimens, not one specimen at two magnifications - the
+file previously assumed otherwise and the person who supplied the images has
+since corrected it. Nothing here may be judged by the two images agreeing. The
+50 nm image is excluded for a separate reason: its size-scale estimate fails
+outright (see test_real_images.py), so it measures grain rather than particles.
 
-Three things are measured here:
+What that leaves is everything that can be checked within a single image, which
+is most of what matters:
 
-  agreement   the two images should report the same size distribution.
-              Reported rather than asserted: at the outer-diameter convention
-              the two disagree by ~6%, and the level sweep at the end shows why
-              - the gap grows with the boundary position, which is imaging blur
-              spreading the wall's outer tail by a fixed number of pixels
+  agreement   printed for reference only. Different specimens have no reason to
+              report the same size, so neither agreement nor disagreement says
+              anything about the analyzer. The level sweep at the end is still
+              worth reading: it shows how the measured size moves with the
+              boundary position, which is the operator's calibration handle
   fidelity    the boundary must land where "경계 기준" says it does - that
               setting is a position across the rim, 0 at its inner flank and 1
               at its outer, so the boundary is checked against the rim's own
@@ -166,7 +168,7 @@ def check(name, ok, detail):
 def main():
     requested = ParticleAnalyzer.DEFAULT_EDGE_LEVEL
     stats = {}
-    print("실제 미크로그래프 정확도 (같은 시료, 배율만 다름)\n")
+    print("실제 미크로그래프 정확도 (서로 다른 시료 2장)\n")
     for label, filename, bar_nm in IMAGES:
         path = os.path.join(HERE, "real", filename)
         if not os.path.exists(path):
@@ -198,19 +200,13 @@ def main():
     print()
     means = [stats[k]["mean"] for k in stats]
     gap = abs(means[0] - means[1]) / np.mean(means) * 100
-    # Reported, not asserted, and the level sweep printed below is the reason.
-    # The disagreement is not a constant offset to be tuned out: it grows with
-    # the boundary position, from 0.5%p at the shell's inner flank to over 6%p
-    # at its outer. That is the shape of a resolution limit rather than a bug.
-    # The outer flank is the far tail of the wall's profile, and the imaging
-    # blur spreads that tail outward by roughly a fixed number of pixels - a
-    # much larger share of a 25 px radius at 500 nm than of a 50 px radius at
-    # 200 nm. Measuring the inner flank would make the two images agree
-    # beautifully and report the wrong quantity, since the size wanted is the
-    # outer diameter. Closing it honestly means deconvolving the wall profile,
-    # which is not attempted here.
-    print(f"  KNOWN 두 배율 일치: 평균 직경 {means[0]:.2f} vs {means[1]:.2f} nm "
-          f"-> {gap:.2f}% 차이 (외경 기준의 분해능 한계, 아래 표 참조)")
+    # Two different specimens: printed so the numbers are visible, asserted
+    # never. An earlier version of this file treated the two as one specimen
+    # and read their agreement as accuracy, which made a coincidence look like
+    # evidence and would have rewarded any change that pulled the two numbers
+    # together for the wrong reason.
+    print(f"  참고  평균 직경 {means[0]:.2f} vs {means[1]:.2f} nm -> {gap:.2f}% 차이 "
+          "(서로 다른 시료이므로 판정 기준 아님)")
 
     for label in stats:
         got = stats[label]["fidelity"]
