@@ -1012,7 +1012,17 @@ class ParticleAnalyzer:
         """
         blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
         _, dark = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(cv2.bitwise_not(dark), 8)
+        # Enclosure is all-or-nothing: a wall that thins below the threshold
+        # for a few pixels opens the interior into the gap beside it, the two
+        # merge into one lumpy region, and the particle is not just mismeasured
+        # but never proposed - no candidate at all, which is what the missed
+        # particles on the real micrographs had in common. Sealing pinholes
+        # before labelling costs nothing where the ring is already closed.
+        # The ray march still uses the raw mask, so wall thickness - and with
+        # it the measured boundary - is unaffected by the repair.
+        sealed = cv2.morphologyEx(dark, cv2.MORPH_CLOSE,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(cv2.bitwise_not(sealed), 8)
         h, w = gray.shape
         dark_mask = dark > 0
 
@@ -1204,6 +1214,7 @@ class ParticleAnalyzer:
             resid = np.abs(np.hypot(keep[:, 0] - ux, keep[:, 1] - uy) - rad)
             rms = float(np.sqrt(np.mean(resid ** 2)) / max(rad, 1))
             coverage = float(good.mean())
+            free_frac = float((good & ~shared).sum() / max(good.sum(), 1))
 
             p = self._measure_circle(int(round(ux)), int(round(uy)), rad,
                                      np.pi * rad * rad)
@@ -1227,8 +1238,29 @@ class ParticleAnalyzer:
             # bright-core fixture the loose bound let marginal arcs through and
             # tripled the spread. Where the arcs disagree, the traced path
             # keeps the particle.
-            p["excluded"] = not (coverage >= 0.60 and rms <= 0.12)
-            p["approx"] = (not p["excluded"]) and not (coverage >= 0.75 and rms <= 0.08)
+            # Two ways to earn the measurement, and the second is what keeps
+            # this path from having to demand most of the circumference.
+            # A shell is visible against open gaps somewhere, so rays that
+            # cross the wall and come out into a gap are direct evidence the
+            # wall belongs to this particle. A gap between two solid particles
+            # that merely sit close has none of them at all - every ray that
+            # found a "wall" was pointing at a neighbour, because the rest run
+            # off into background and are discarded. On the grainy fixture the
+            # free-ray fraction is exactly zero for every candidate, against a
+            # third to four fifths on the real micrographs. Demanding
+            # circumference instead of evidence was costing real particles at
+            # 0.60 coverage, and the traced path then drew a larger circle
+            # spanning the neighbour in their place.
+            enough = ((coverage >= 0.35 and free_frac >= 0.05)
+                      or coverage >= 0.60)
+            p["excluded"] = not (enough and rms <= 0.12)
+            # "근사" means the circle rests on a partial arc and the rest is
+            # extrapolation. With the wall seen most of the way round and the
+            # arcs agreeing closely, it is a measurement, not an estimate;
+            # holding it to three quarters of the circumference marked two
+            # thirds of a packed field approximate and made the colour
+            # meaningless.
+            p["approx"] = (not p["excluded"]) and not (coverage >= 0.60 and rms <= 0.10)
             out.append(p)
         return out
 
