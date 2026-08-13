@@ -26,7 +26,8 @@ properties of that formula rather than of any drawing choice:
     arrangements are kept: a boundary rule that only works on one of them is
     reading contrast rather than structure.
 
-Returns (x, y, R) per particle, R being the outer radius in pixels.
+Returns (x, y, R, cored) per particle, R being the outer radius in pixels
+and `cored` whether that particle carries a dense core.
 """
 import os
 import sys
@@ -38,8 +39,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def generate_shelled_image(path, radius=60, shell_frac=0.18, count=40,
-                           size=1024, seed=7, mu=0.020, gap=0.06, noise=6.0):
-    """Sparse hollow spheres, `radius` px on average, `gap` apart at the least."""
+                           size=1024, seed=7, mu=0.020, gap=0.06, noise=6.0,
+                           cored=0.0, core_frac=0.55, core_mu=2.5):
+    """Sparse hollow spheres, `radius` px on average, `gap` apart at the least.
+
+    ``cored`` is the fraction of particles carrying a dense core inside the
+    cavity - yolk-shell, or simply ones the template was never removed from.
+    Real preparations contain a minority of them and they are much darker than
+    the rest, which is a problem for any step that decides what a particle
+    should look like from the population: a minority that looks different is
+    exactly what such a rule throws away. ``core_mu`` is a multiple of the
+    shell's absorption, since the core is solid where the shell is porous.
+    """
     rng = np.random.RandomState(seed)
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
     thickness = np.zeros((size, size), np.float32)
@@ -55,12 +66,16 @@ def generate_shelled_image(path, radius=60, shell_frac=0.18, count=40,
             continue
         placed.append((cx, cy, r))
 
-    for cx, cy, r in placed:
+    has_core = rng.rand(len(placed)) < cored
+    for (cx, cy, r), core in zip(placed, has_core):
         r_in = r * (1.0 - shell_frac)
         b2 = (xx - cx) ** 2 + (yy - cy) ** 2
         outer = np.sqrt(np.clip(r * r - b2, 0, None))
         inner = np.sqrt(np.clip(r_in * r_in - b2, 0, None))
         thickness += 2.0 * (outer - inner)
+        if core:
+            r_c = r_in * core_frac
+            thickness += 2.0 * core_mu * np.sqrt(np.clip(r_c * r_c - b2, 0, None))
 
     img = 232.0 * np.exp(-mu * thickness)
     # The microscope's blur is what turns the outer edge from a step into a
@@ -71,8 +86,9 @@ def generate_shelled_image(path, radius=60, shell_frac=0.18, count=40,
                                    cv2.COLOR_GRAY2BGR))
     print(f"Generated shelled image: {path}")
     print(f"  Particles: {len(placed)}   outer radius ~{radius}px   "
-          f"shell {shell_frac * 100:.0f}% of radius")
-    return [(x, y, r) for x, y, r in placed]
+          f"shell {shell_frac * 100:.0f}% of radius"
+          + (f"   cored {int(has_core.sum())}" if cored else ""))
+    return [(x, y, r, bool(c)) for (x, y, r), c in zip(placed, has_core)]
 
 
 if __name__ == "__main__":

@@ -1473,10 +1473,19 @@ class ParticleAnalyzer:
         angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
         cos_a, sin_a = np.cos(angles), np.sin(angles)
 
+        # Read the ring just inside the wall, not the whole disc. A real
+        # preparation contains a minority of particles whose template was never
+        # removed, and they are far darker in the middle than the rest - which
+        # is precisely what a rule that learns "what a particle looks like"
+        # from the population will throw away. Averaged over the whole disc
+        # they sat well outside the band and every one of them was excluded.
+        # The band just inside the wall is the part that is the same for all of
+        # them, cored or not, while a gap or an overlap lens has no such
+        # structure and reads its own level there too.
         levels = []
         for p in candidates:
             samples = []
-            for frac in (0.0, 0.25, 0.5, 0.75):
+            for frac in (0.60, 0.72, 0.84):
                 r = p["radius_px"] * frac
                 xs = np.clip((p["center_x"] + r * cos_a).astype(int), 0, w - 1)
                 ys = np.clip((p["center_y"] + r * sin_a).astype(int), 0, h - 1)

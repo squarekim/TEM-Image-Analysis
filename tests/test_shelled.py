@@ -13,6 +13,15 @@ two shell thicknesses; in a packed field the gaps are darkened by neighbouring
 shells and the interiors come out brighter. A boundary rule that reads contrast
 rather than structure passes one of those and fails the other.
 
+It also carries a minority of particles with a dense core - the ones a real
+preparation is never entirely free of, where the template was not removed. They
+matter out of proportion to their number, because any step that decides what a
+particle should look like by learning it from the population will throw away
+exactly the particles that look different. This is not hypothetical: judging
+the interior over the whole disc excluded every one of them, and the fix was to
+read the ring just inside the wall, which is the part cored and hollow
+particles have in common.
+
 Result: the outer diameter comes out 1-3% small across a four-fold range of
 particle size, with no false detections. The bias is the half-height criterion
 sitting just inside the true edge on a blurred flank, and it shrinks as the
@@ -60,6 +69,55 @@ def measure(path, truth):
     return errors, len(used), len(valid) - len(used)
 
 
+def cored_case():
+    """A dark-cored minority must survive, and be sized like the rest."""
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bench")
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, "cored.png")
+    failures = []
+    print("\n코어를 가진 소수 입자가 섞였을 때 (템플릿이 남은 입자)")
+    for fraction in (0.10, 0.25, 0.40):
+        truth = generate_shelled_image(path, radius=70, count=32, seed=11,
+                                       cored=fraction, size=SIZE)
+        truth = [(x, y, r, c) for x, y, r, c in truth
+                 if x - r >= 0 and y - r >= 0 and x + r <= SIZE and y + r <= SIZE]
+        valid = [p for p in ParticleAnalyzer().analyze(
+            load_image(path), min_area_px=100, circularity_thresh=0.5,
+            hollow=True, detect_cores=True) if not p.get("excluded")]
+
+        found = {True: 0, False: 0}
+        total = {True: 0, False: 0}
+        errors, flagged, used = [], 0, set()
+        for tx, ty, tr, cored in truth:
+            total[cored] += 1
+            best, best_d = None, None
+            for i, p in enumerate(valid):
+                if i in used:
+                    continue
+                d = np.hypot(p["center_x"] - tx, p["center_y"] - ty)
+                if d < tr * 0.6 and (best_d is None or d < best_d):
+                    best, best_d = i, d
+            if best is None:
+                continue
+            used.add(best)
+            found[cored] += 1
+            if cored:
+                errors.append((valid[best]["radius_px"] - tr) / tr * 100)
+                flagged += bool(valid[best].get("has_core"))
+
+        recall = found[True] / max(total[True], 1) * 100
+        plain = found[False] / max(total[False], 1) * 100
+        bias = float(np.mean(errors)) if errors else float("nan")
+        ok = recall >= 75.0 and plain >= 90.0 and abs(bias) <= MAX_ERROR_PCT
+        print(f"  {'PASS' if ok else 'FAIL'}  코어 비율 {fraction * 100:3.0f}%   "
+              f"코어입자 {found[True]:2d}/{total[True]:<2d} ({recall:3.0f}%)   "
+              f"일반 {found[False]:2d}/{total[False]:<2d} ({plain:3.0f}%)   "
+              f"외경 오차 {bias:+5.1f}%   코어로 판정 {flagged}/{found[True]}")
+        if not ok:
+            failures.append(f"코어 비율 {fraction * 100:.0f}%: 회수 {recall:.0f}%")
+    return failures
+
+
 def main():
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bench")
     os.makedirs(out, exist_ok=True)
@@ -72,7 +130,7 @@ def main():
                                        count=count, size=SIZE)
         # A particle the frame cuts through has no determinable diameter and is
         # excluded by design, so it cannot count against recall.
-        truth = [(x, y, r) for x, y, r in truth
+        truth = [(x, y, r) for x, y, r, _ in truth
                  if x - r >= 0 and y - r >= 0 and x + r <= SIZE and y + r <= SIZE]
         errors, matched, spurious = measure(path, truth)
         if not errors:
@@ -90,6 +148,7 @@ def main():
             failures.append(f"{label}: 오차 {mean:+.1f}%, 회수 {recall:.0f}%, "
                             f"거짓 {spurious}")
 
+    failures += cored_case()
     print("\n" + ("전체 통과" if not failures else "실패: " + "; ".join(failures)))
     return 1 if failures else 0
 
