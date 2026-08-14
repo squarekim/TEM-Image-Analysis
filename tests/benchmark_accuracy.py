@@ -43,7 +43,11 @@ def match(truth, found, tol_factor=0.6):
 def score(name, path, truth, hollow):
     # The synthetic fixtures encode the outer-edge convention: their ground
     # truth is the outer edge of the rim, the size a person marks when the
-    # particle sits on a clear background (see generate_rimmed_image). Real
+    # particle sits on a clear background (see generate_rimmed_image). That is
+    # a claim about the generators, and one of them did not honour it: the
+    # dense fixture recorded the radius it handed to cv2.circle while drawing a
+    # two-pixel rim straddling it, so the particle ended a pixel further out
+    # than the truth said and a correct measurement scored 6.8% large. Real
     # densely-packed hollow silica is measured to the dark shell ring instead -
     # there is no background outside, the neighbour is right there - which is
     # why the product default is lower. Each is scored at its own convention:

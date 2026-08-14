@@ -79,7 +79,12 @@ def generate_dense_tem_image(output_path, width=2048, height=1800, target_count=
             pnoise = rng.normal(0, 4, patch.shape).astype(np.int16)
             img[y1:y2, x1:x2] = np.clip(patch + pnoise, 0, 255).astype(np.uint8)
 
-        particles.append((cx, cy, radius, brightness))
+        # The rim is two pixels wide and straddles `radius`, so the particle
+        # actually ends about a pixel further out than the number handed to
+        # cv2.circle. The ground truth records where the particle ends, since
+        # that is what the analyzer is asked for; recording the nominal radius
+        # instead scored a correct measurement as 6.8% large.
+        particles.append((cx, cy, radius + 1, brightness))
 
     # Scale bar
     bar_y = height + 30
