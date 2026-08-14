@@ -17,21 +17,28 @@ The scale bar is read from each image, so the comparison is in nanometres.
 Result: the 200 nm and 500 nm images report sizes within 3% of each other,
 which given the above is a coincidence worth printing and nothing to lean on.
 
-The 50 nm image is separately and definitely wrong, for a reason that needs no
-comparison with anything: _estimate_radius picks 21.7 px for particles whose
-radius is about 185 px, so the seed search runs over the wrong size range
-entirely and returns hundreds of grain speckles instead of the eight particles
-that are there.
+The 50 nm image used to measure grain rather than particles - 16 nm where the
+particles are about 90 - and it is now fixed. The record of how, because the
+same trap is easy to fall back into:
 
-The cause is in the band score, which is the validated fraction multiplied by
-the *number* of circles the band found. Small circles are always the more
-numerous, so on a grainy image of a few large particles the speckle band scored
-128 circles against the real band's 6 and won by twenty to one. Weighing by the
-fraction of the frame the circles account for says the opposite and says it
-clearly - 0.18 against 0.48 - but coverage on its own hands other images to a
-handful of spurious large circles that happen to cover the frame (the 500 nm
-image here, and the hollow and touching fixtures), so it is not a fix on its
-own and is not applied.
+_estimate_radius scored each octave band by validated fraction times the
+*number* of circles it found. Small circles are always the more numerous, so on
+a grainy image of a dozen large particles the grain-scale band offered 159
+circles against the real band's 8 and won twenty to one. The validated fraction
+could not object, because the threshold that validates a band is drawn from
+that band's own edge scores - a band of pure noise grades itself on a curve,
+and this one passed 81%.
+
+Two fixes that look obvious do not work. Weighting by the fraction of the frame
+covered hands sparse images to a few huge circles that happen to span it
+(hollow, touching, solid and dense all break). Comparing edge strength across
+bands is meaningless, since each band is searched at its own smoothing.
+
+What grain cannot fake is a round boundary. Fitting a circle to the traced edge
+and measuring how far the edge strays from it separates the two on every image
+available, real and synthetic: true bands 0.005-0.025 of a radius, grain bands
+0.040-0.055, with nothing in between. Roundness now decides which bands are
+eligible and population only breaks ties among them.
 """
 import os
 import sys
@@ -104,15 +111,17 @@ def main():
               "(서로 다른 시료이므로 판정 기준 아님)")
 
     if KNOWN_BAD in results:
-        # Stated against this image alone, not against the others: the failure
-        # is that _estimate_radius picks a 21.7 px seed size for particles
-        # whose radius is about 185 px, so what gets measured is grain. No
-        # comparison with another specimen is needed to see that.
-        print(f"  KNOWN {KNOWN_BAD}: 직경 {results[KNOWN_BAD]:.1f} nm - 미해결. "
-              "씨앗 크기 추정이 실제 입자의 1/6을 고르는 탓에 "
-              "입자가 아니라 이미지 그레인을 세고 있음 (파일 상단 설명 참조)")
+        # This image used to report 16 nm - image grain - and is now asserted
+        # like the rest. The bar is deliberately loose: what failed before was
+        # off by a factor of six, and no ground truth exists for this image.
+        d = results[KNOWN_BAD]
+        ok = 40.0 <= d <= 200.0
+        print(f"  {'PASS' if ok else 'FAIL'}  {KNOWN_BAD}: 직경 {d:.1f} nm "
+              "(그레인을 세면 20nm 미만으로 나옴)")
+        if not ok:
+            failures.append(f"{KNOWN_BAD}: 직경 {d:.1f} nm — 입자가 아닌 그레인")
 
-    print("\n" + ("통과 (미해결 항목 제외)" if not failures else "실패: " + "; ".join(failures)))
+    print("\n" + ("전체 통과" if not failures else "실패: " + "; ".join(failures)))
     return 1 if failures else 0
 
 

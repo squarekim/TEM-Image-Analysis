@@ -155,6 +155,13 @@ class ParticleAnalyzer:
     #: analyzer picks this per ray instead; see `_outer_by_level`.
     DEFAULT_EDGE_LEVEL = 0.95
 
+    #: How far a band's traced edges may stray from the circle fitted to them,
+    #: as a share of radius, for that band to be considered the particle scale
+    #: at all. Real particles' bands measure 0.005-0.025 on every image tested,
+    #: real and synthetic; bands that are actually image grain measure
+    #: 0.040-0.055. The cut sits in the empty gap between them.
+    BAND_MAX_ROUGHNESS = 0.030
+
     #: How much deeper than the interior the dark band must be, as a share of
     #: its contrast, for one ray to call it a shell wall. Set below what a
     #: shell actually gives (0.4 upwards) rather than at the midpoint, because
@@ -498,7 +505,7 @@ class ParticleAnalyzer:
         for circles whose boundary actually looks like a particle edge, which
         grain cannot fake.
         """
-        best_score, best_est = 0.0, None
+        bands = []
         lo = min_r
         while lo < max_r:
             hi = min(max_r, lo * 2)
@@ -530,21 +537,51 @@ class ParticleAnalyzer:
             if not scores:
                 continue
             thresh = np.percentile(scores, 30)
-            passed = 0
+            passed, roundness = 0, []
             for (cx, cy, r), trace in zip(sample, traces):
                 fit = self._robust_circle_fit(int(cx), int(cy), trace[0],
                                               trace[1], trace[2], thresh,
                                               r0=int(r))
-                if fit and fit[3] >= 0.5 and fit[4] <= 0.10:
+                if not fit:
+                    continue
+                roundness.append(fit[4])
+                if fit[3] >= 0.5 and fit[4] <= 0.10:
                     passed += 1
+            if not roundness:
+                continue
+            bands.append(((passed / len(sample)) * len(circles),
+                          float(np.median(roundness)),
+                          self._radius_mode(circles[:, 2])))
 
-            # Scale the validated fraction by the population so a band with a
-            # few solid circles beats one with many unconvincing ones.
-            score = (passed / len(sample)) * len(circles)
-            if score > best_score:
-                best_score = score
-                best_est = self._radius_mode(circles[:, 2])
-        return best_est
+        if not bands:
+            return None
+        # Population alone cannot choose the band, because the smaller the
+        # circle the more of them any image yields: on a grainy micrograph of a
+        # dozen large particles the grain-scale band offered 159 circles
+        # against the real band's 8 and won twenty to one, and the program then
+        # measured grain. Neither can validated fraction rescue it - the
+        # threshold that validates a band is drawn from that band's own edge
+        # scores, so a band of pure noise grades itself on a curve and passed
+        # 81% of its circles.
+        #
+        # What grain cannot fake is a round boundary. Fitting a circle to the
+        # traced edge and asking how far the edge strays from it separates the
+        # two everywhere it was measured: real particles' bands sit at 0.005 to
+        # 0.025 of a radius, grain-scale bands at 0.040 to 0.055, on both real
+        # micrographs and every fixture. So roundness decides which bands are
+        # eligible, and population only breaks ties among bands that are
+        # equally round - which is what it was always good for, telling a
+        # sparsely populated true scale from a densely populated one.
+        # An absolute cut, because that is how the measurement actually falls -
+        # the two groups are separated by a wide empty gap, not by a ratio, and
+        # a ratio decided the dense fixture on the third decimal place. The
+        # relative term only takes over on an image whose fits are all rougher
+        # than the cut, where what matters is which band is roundest rather
+        # than whether it clears a bar set on other images.
+        best_round = min(b[1] for b in bands)
+        limit = max(self.BAND_MAX_ROUGHNESS, best_round * 1.5)
+        eligible = [b for b in bands if b[1] <= limit]
+        return max(eligible, key=lambda b: b[0])[2]
 
     def _choose_boundary(self, cx, cy, angles, trace, score_thresh, r0,
                          outer_thresh=None, blurred=None):
