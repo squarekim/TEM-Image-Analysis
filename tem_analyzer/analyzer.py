@@ -155,6 +155,14 @@ class ParticleAnalyzer:
     #: analyzer picks this per ray instead; see `_outer_by_level`.
     DEFAULT_EDGE_LEVEL = 0.95
 
+    #: How much of the winning band's score a second scale must carry to be
+    #: run as well. A genuine second population shows up in numbers; a few
+    #: circles at an odd size are stragglers of the first.
+    SCALE_MIN_SHARE = 0.10
+
+    #: At most this many size scales are searched. Each one costs a full pass.
+    MAX_SCALES = 3
+
     #: How far a band's traced edges may stray from the circle fitted to them,
     #: as a share of radius, for that band to be considered the particle scale
     #: at all. Real particles' bands measure 0.005-0.025 on every image tested,
@@ -333,14 +341,39 @@ class ParticleAnalyzer:
         return True
 
     def _detect_hough(self, gray, min_area_px):
+        """Detect at every size scale the image actually contains.
+
+        One scale is chosen for the whole image, and everything downstream is
+        matched to it: the seed search runs from 0.6 to 1.5 of it, and the
+        gradients every boundary is traced on are smoothed to it. A sample with
+        one size is served perfectly by that and a sample with two is not. On
+        the hard fixture, whose scale is set by particles of radius 25-42, the
+        four particles of radius 6-9 fall outside the seed search entirely and
+        come out 18.5% oversize; the same four, cropped out and analysed on
+        their own, come out 2.7% - so it is the company they keep, not the
+        particles.
+
+        So the scales are detected and each is run in full. Which extra scales
+        are real is the same question the band scan already answers by
+        roundness, and only bands that clear it are eligible, so this cannot
+        turn image grain into a second population.
+        """
         h, w = gray.shape
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.5)
         min_r = max(5, int(np.sqrt(min_area_px / np.pi)))
         max_r = max(min_r + 1, min(h, w) // 3)
 
-        est = self._estimate_radius(gray, blurred, min_r, max_r, w, h)
-        if est is None:
+        scales = self._estimate_radius(gray, blurred, min_r, max_r, w, h)
+        if not scales:
             return []
+        found = []
+        for est in scales:
+            part = self._detect_at_scale(gray, blurred, min_area_px, est,
+                                         min_r, w, h)
+            found = self._merge_detections(found, part) if found else part
+        return found
+
+    def _detect_at_scale(self, gray, blurred, min_area_px, est, min_r, w, h):
         gx, gy = self._gradients(gray, est)
 
         min_r2 = max(min_r, int(est * 0.6))
@@ -586,7 +619,24 @@ class ParticleAnalyzer:
         best_round = min(b[1] for b in bands)
         limit = max(self.BAND_MAX_ROUGHNESS, best_round * 1.5)
         eligible = [b for b in bands if b[1] <= limit]
-        return max(eligible, key=lambda b: b[0])[2]
+        eligible.sort(key=lambda b: b[0], reverse=True)
+
+        # Every eligible scale is returned, not just the winner, because an
+        # image may honestly contain more than one. A band is only kept if it
+        # carries a real share of the population - a scale with a handful of
+        # circles beside one with hundreds is a straggler, not a second
+        # population - and if it is far enough from a scale already taken to be
+        # a different size at all rather than the same one seen twice.
+        chosen = []
+        for score, _, radius in eligible:
+            if score < eligible[0][0] * self.SCALE_MIN_SHARE:
+                break
+            if any(0.6 <= radius / taken <= 1.7 for taken in chosen):
+                continue
+            chosen.append(radius)
+            if len(chosen) >= self.MAX_SCALES:
+                break
+        return chosen
 
     def _choose_boundary(self, cx, cy, angles, trace, score_thresh, r0,
                          outer_thresh=None, blurred=None):
