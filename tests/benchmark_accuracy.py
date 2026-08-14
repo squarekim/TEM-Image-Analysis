@@ -4,6 +4,21 @@ The synthetic generators know exactly where every particle is and how big it
 is, so they can score the analyzer rather than just count what it found:
 detections are matched to ground truth by centre distance and the radius error
 is reported in pixels and percent.
+
+Two fixtures are at their floor rather than waiting to be improved, and the
+evidence is recorded here so the next person does not spend the afternoon
+finding it again:
+
+  hard    5.7%, and all of it is four particles of radius 6-9 measured about
+          20% large. They are below the seed search, and they cannot be
+          brought into it: the octave scan needs three circles to call a band,
+          and Hough finds one of the four at param2=30 and still only one at
+          param2=15, by which point four spurious circles have appeared. At
+          12-18 px across in noise of sigma 12 they are at the detection
+          limit. Everything else in that fixture measures within 1.4%.
+  hollow  2.0%, of which the bias is -1.1% (-0.34 px) and the rest is scatter
+          between particles, 4.1%. That is measurement noise on individual
+          boundaries, not a systematic error with a cause to remove.
 """
 import os
 import sys
