@@ -10,8 +10,23 @@ Known gap, unresolved: at the lowest magnification the particles come out about
 9% small, and the "경계 기준" setting has no effect on that number at all -
 which locates the fault. The setting only moves the boundary found from the
 brightness profile, so a number it cannot move means that boundary is not being
-used: the per-image rim vote fails at this scale and every particle falls back
-to the steepest-gradient edge, which sits at the ring's inner flank.
+used, and every particle falls back to the steepest-gradient edge.
+
+Why it is not used is now known, and it is not the rim vote. Reaching the
+brightness boundary requires it to come out at least half a pixel outside the
+gradient crest, on the reasoning that a rim's outer edge lies beyond its crest.
+Where a shell's outer flank tapers instead of stepping, the crest already sits
+as far out as the profile goes and the two coincide - so a correct boundary is
+rejected for not being further out, and the setting has nothing to move.
+
+Removing that ordering test does make the setting responsive (90% to 100% then
+moves the answer by 2.5%p where it moved 0.2%p before) and improves the hollow
+fixture from 2.3% to 1.4%. It also admits the curved gap between three packed
+particles as a particle, because such a gap clears every remaining test:
+test_false_positives goes from zero ghosts to one. A tolerance instead of a
+threshold does not separate them either - the ghost's two boundaries coincide
+just as closely as the shell's do. Ghosts cost more than an inert setting, so
+the ordering test stays and this is written down rather than traded away.
 
 Attempts that did not work, so the next person does not repeat them:
   - judging the rim's polarity against the interior instead of the outside

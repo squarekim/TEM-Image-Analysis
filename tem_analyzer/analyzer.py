@@ -155,6 +155,20 @@ class ParticleAnalyzer:
     #: analyzer picks this per ray instead; see `_outer_by_level`.
     DEFAULT_EDGE_LEVEL = 0.95
 
+    #: How much deeper than the interior the dark band must be, as a share of
+    #: its contrast, for one ray to call it a shell wall. Set below what a
+    #: shell actually gives (0.4 upwards) rather than at the midpoint, because
+    #: the discrimination that matters is done by RIM_MIN_RAYS instead.
+    RIM_DEPTH_FRAC = 0.35
+
+    #: What share of a particle's rays must see that wall. This, not the depth,
+    #: is what tells a shell from noise. A hollow particle shows its wall on
+    #: essentially every ray - the fixtures give 97-100% - while a noisy solid
+    #: particle produces troughs deep enough to pass on a scattered 57% of
+    #: them. Judging by depth alone, or by a simple majority, put the two on
+    #: the same side.
+    RIM_MIN_RAYS = 0.85
+
     #: A ray faces a touching neighbour, rather than open background, when the
     #: level just outside the dark band is nearly the particle's own interior
     #: level - the neighbour's interior is as bright as ours, a gap is not.
@@ -639,8 +653,15 @@ class ParticleAnalyzer:
             # cannot work here: half-recovery is on the far flank of that same
             # dip, so the profile between them only ever rises.
             if np.isfinite(interior[i]):
+                # How much deeper the band is than the particle's own inside,
+                # as a share of the band's total contrast. A solid particle has
+                # nothing there - its darkest point *is* its inside - so the
+                # share is zero, while a shell puts a real trough between the
+                # two. The threshold is deliberately well below what a shell
+                # gives, because what separates a shell from noise is not depth
+                # but consistency: see the rim_frac test at the call site.
                 rim_votes.append(abs(interior[i] - extreme)
-                                 >= max(12.0, 0.50 * contrast))
+                                 >= max(12.0, self.RIM_DEPTH_FRAC * contrast))
             # Place the boundary anywhere across the rim, not just outside it.
             # Walking outward from the rim's darkest point can never put the
             # edge on the rim itself, let alone on its inner flank, so the
@@ -716,6 +737,13 @@ class ParticleAnalyzer:
                                         outer_thresh, r0=r0)
 
         qualifies = False
+        # The half-pixel is load-bearing, and not for the reason its author
+        # may have had in mind. Dropping it does let the level boundary be used
+        # on shells whose outer flank tapers, where it coincides with the
+        # gradient crest - but it also admits the curved gap between three
+        # packed particles as a particle, because such a gap has a boundary
+        # that passes every other test. Reported ghosts cost more than an
+        # inert setting; see _select_boundary and test_bright_core.
         if outer is not None and strong is not None and outer[2] > strong[2] + 0.5:
             # The evidence has to be free of scale, or the same sample answers
             # differently at two magnifications - which is backwards, since the
@@ -734,7 +762,7 @@ class ParticleAnalyzer:
             # really does lie between it and the inner edge.
             qualifies = bool(
                 outer[3] >= 0.30 and outer[4] <= 0.12
-                and (blurred is None or rim_frac >= 0.5))
+                and (blurred is None or rim_frac >= self.RIM_MIN_RAYS))
 
         return {"strong": strong, "outer": outer, "qualifies": qualifies,
                 "rim_frac": rim_frac,
