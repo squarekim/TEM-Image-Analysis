@@ -118,6 +118,51 @@ def cored_case():
     return failures
 
 
+def sphere_edge_case():
+    """The opt-in edge model, and the trade it makes, in numbers."""
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bench")
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, "sphere_edge.png")
+    failures = []
+    print("\n구 모서리 외삽 (sphere_edge) — 켜고 끄고 비교")
+    for radius, shell in ((30, 0.18), (60, 0.18), (120, 0.18), (60, 0.08), (60, 0.30)):
+        truth = generate_shelled_image(path, radius=radius, shell_frac=shell,
+                                       count=40 if radius < 100 else 16, size=SIZE)
+        truth = [(x, y, r) for x, y, r, _ in truth
+                 if x - r >= 0 and y - r >= 0 and x + r <= SIZE and y + r <= SIZE]
+        row = []
+        for flag in (False, True):
+            valid = [p for p in ParticleAnalyzer(sphere_edge=flag).analyze(
+                load_image(path), min_area_px=100, circularity_thresh=0.5,
+                hollow=True) if not p.get("excluded")]
+            errors, used = [], set()
+            for tx, ty, tr in truth:
+                best, best_d = None, None
+                for i, p in enumerate(valid):
+                    if i in used:
+                        continue
+                    d = np.hypot(p["center_x"] - tx, p["center_y"] - ty)
+                    if d < tr * 0.6 and (best_d is None or d < best_d):
+                        best, best_d = i, d
+                if best is not None:
+                    used.add(best)
+                    errors.append((valid[best]["radius_px"] - tr) / tr * 100)
+            row.append(float(np.mean(errors)) if errors else float("nan"))
+        off, on = row
+        # The point of the option is that it removes the bias, so that is what
+        # is asserted - not that it beats the default by some margin.
+        ok = abs(on) <= 1.5
+        print(f"  {'PASS' if ok else 'FAIL'}  반지름 {radius:3d}px 쉘 {shell * 100:2.0f}%   "
+              f"끔 {off:+6.2f}%   켬 {on:+6.2f}%")
+        if not ok:
+            failures.append(f"r={radius} 쉘{shell * 100:.0f}%: 켬 {on:+.2f}%")
+    print("  참고: 이 옵션은 계단 모서리(두께 일정한 원반)를 1px쯤 크게 읽습니다.")
+    print("        benchmark_accuracy를 켜고 돌리면 grainy 0.3%->8.0%, "
+          "rimmed 0.9%->3.8%.")
+    print("        실제 입자는 구이므로 기본값은 끔, 판단은 사용자 몫입니다.")
+    return failures
+
+
 def main():
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bench")
     os.makedirs(out, exist_ok=True)
@@ -149,6 +194,7 @@ def main():
                             f"거짓 {spurious}")
 
     failures += cored_case()
+    failures += sphere_edge_case()
     print("\n" + ("전체 통과" if not failures else "실패: " + "; ".join(failures)))
     return 1 if failures else 0
 

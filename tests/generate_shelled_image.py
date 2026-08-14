@@ -40,7 +40,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def generate_shelled_image(path, radius=60, shell_frac=0.18, count=40,
                            size=1024, seed=7, mu=0.020, gap=0.06, noise=6.0,
-                           cored=0.0, core_frac=0.55, core_mu=2.5):
+                           cored=0.0, core_frac=0.55, core_mu=2.5,
+                           blur=None):
     """Sparse hollow spheres, `radius` px on average, `gap` apart at the least.
 
     ``cored`` is the fraction of particles carrying a dense core inside the
@@ -80,7 +81,8 @@ def generate_shelled_image(path, radius=60, shell_frac=0.18, count=40,
     img = 232.0 * np.exp(-mu * thickness)
     # The microscope's blur is what turns the outer edge from a step into a
     # flank, and it is the whole reason the boundary needs a sub-pixel rule.
-    img = cv2.GaussianBlur(img, (0, 0), max(1.0, radius * 0.025))
+    img = cv2.GaussianBlur(img, (0, 0),
+                           max(0.6, radius * 0.025) if blur is None else blur)
     img = img + rng.normal(0, noise, (size, size))
     cv2.imwrite(path, cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8),
                                    cv2.COLOR_GRAY2BGR))

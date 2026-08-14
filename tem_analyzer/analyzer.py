@@ -183,11 +183,14 @@ class ParticleAnalyzer:
     #: exposure or magnification.
     CONTACT_GAP_FRAC = 0.30
 
-    def __init__(self, nm_per_px=None, edge_level="auto"):
+    def __init__(self, nm_per_px=None, edge_level="auto", sphere_edge=False):
         self.nm_per_px = nm_per_px
         #: None means decide per ray; a float pins every ray to that position.
         self.edge_level = (None if edge_level is None or edge_level == "auto"
                            else float(np.clip(edge_level, 0.0, 1.0)))
+        #: Place the boundary by extrapolating the sphere's own edge profile
+        #: rather than by a brightness threshold. See `_sphere_edge_radius`.
+        self.sphere_edge = bool(sphere_edge)
 
     def analyze(self, image, min_area_px=100, max_area_px=None,
                 circularity_thresh=0.5, use_watershed=True, hollow=False,
@@ -267,6 +270,8 @@ class ParticleAnalyzer:
             particles = kept
 
         self._reject_implausible_interiors(particles, analysis_region)
+        if self.sphere_edge:
+            self._refine_by_sphere_edge(particles, analysis_region)
         self._reject_clipped(particles, analysis_region.shape)
         self._resolve_overlaps(particles, cv2.GaussianBlur(analysis_region, (0, 0), 1.5))
         self._reject_buried(particles)
@@ -1427,6 +1432,112 @@ class ParticleAnalyzer:
                 or not (0 <= ux < w and 0 <= uy < h)):
             return cx, cy, r
         return int(round(ux)), int(round(uy)), int(round(rad))
+
+    #: Where on the edge profile the extrapolation is fitted, as a share of the
+    #: edge's own contrast. Chosen by sweeping: further out the imaging blur
+    #: bends the curve and the answer drifts with it (0.20-0.60 moves 1.3 px
+    #: between blur 0.8 and 3.0); further in the square-root approximation
+    #: fails. At 0.40-0.80 the drift is 0.5 px across that range.
+    SPHERE_FIT_BAND = (0.40, 0.80)
+
+    def _sphere_edge_radius(self, blurred, cx, cy, r_seed, n_ang=180):
+        """Outer radius from the shape of a sphere's edge, not its brightness.
+
+        A sphere's projected thickness near the rim goes as sqrt(R - b), so the
+        contrast against the background does too, and the SQUARE of that
+        contrast is a straight line in b whose root is exactly R. Fitting the
+        line and reading its root asks nothing about how dark is dark enough,
+        so exposure, absorption and shell thickness cannot move the answer.
+
+        This matters because a sphere's edge is not a step and no threshold
+        criterion lands on it. Measured against geometry the current boundary
+        comes out 1.05 px inside R on a sphere and 1.06 px inside on a hollow
+        shell, while on a flat disc - a true step - it is exact to 0.02 px. The
+        deficit is the edge shape, not the search. Extrapolation reverses that:
+        0.13 px outside R on the shell, and the scatter between particles drops
+        from 0.52 px to 0.03 px because the fit uses the whole flank rather
+        than one crossing.
+
+        The cost is that a genuine step edge is read 1.1 px too large, and no
+        way was found to tell the two apart from the profile - linearity of the
+        fit and the shape of the tail were both tried and neither separates
+        them. So this is opt-in rather than automatic. Real particles are
+        spheres; the flat disc is a drawing convenience that several fixtures
+        happen to use.
+        """
+        h, w = blurred.shape
+        ang = np.linspace(0, 2 * np.pi, n_ang, endpoint=False)
+        rr = np.arange(r_seed * 0.75, r_seed * 1.45, 0.25)
+        if len(rr) < 8:
+            return None
+        xs = cx + np.outer(np.cos(ang), rr)
+        ys = cy + np.outer(np.sin(ang), rr)
+        if xs.min() < 0 or ys.min() < 0 or xs.max() >= w - 1 or ys.max() >= h - 1:
+            return None
+        x0 = xs.astype(np.intp)
+        y0 = ys.astype(np.intp)
+        fx, fy = xs - x0, ys - y0
+        prof = (blurred[y0, x0] * (1 - fx) * (1 - fy)
+                + blurred[y0, x0 + 1] * fx * (1 - fy)
+                + blurred[y0 + 1, x0] * (1 - fx) * fy
+                + blurred[y0 + 1, x0 + 1] * fx * fy)
+
+        lo_f, hi_f = self.SPHERE_FIT_BAND
+        far = rr >= r_seed * 1.30
+        near = rr <= r_seed * 1.10
+        found = []
+        for j in range(n_ang):
+            p = prof[j]
+            contrast = np.clip(np.percentile(p[far], 80) - p, 0.0, None)
+            peak = float(contrast[near].max())
+            if peak < 6.0:
+                continue
+            d = contrast ** 2
+            band = (d >= (lo_f * peak) ** 2) & (d <= (hi_f * peak) ** 2)
+            idx = np.flatnonzero(band)
+            if idx.size < 4:
+                continue
+            # Only the outward side of the peak: the same contrast occurs on
+            # the way in, and fitting both sides would average them.
+            idx = idx[idx >= int(np.argmax(contrast))]
+            if idx.size < 4:
+                continue
+            slope, intercept = np.polyfit(rr[idx], d[idx], 1)
+            if slope >= 0:
+                continue
+            found.append(-intercept / slope)
+        if len(found) < n_ang * 0.4:
+            return None
+        return float(np.median(found))
+
+    def _refine_by_sphere_edge(self, particles, gray):
+        """Re-place each boundary on the sphere's edge, keeping the centre.
+
+        The centre and the outline come from the traced fit and are left alone;
+        only the radius moves, because the extrapolation measures a radius and
+        nothing else. A particle whose edge the fit cannot read - too near the
+        frame, too little contrast - keeps the radius it had.
+        """
+        blurred = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.2)
+        for p in particles:
+            if p.get("excluded"):
+                continue
+            r0 = p["radius_px"]
+            r = self._sphere_edge_radius(blurred, p["center_x"], p["center_y"], r0)
+            if r is None or not (0.7 * r0 <= r <= 1.4 * r0):
+                continue
+            scale = r / r0
+            p["radius_px"] = r
+            p["area_px"] = float(np.pi * r * r)
+            if self.nm_per_px:
+                p["diameter"] = 2.0 * r * self.nm_per_px
+            else:
+                p["diameter"] = 2.0 * r
+            if p.get("contour") is not None:
+                pts = p["contour"].reshape(-1, 2).astype(np.float64)
+                centre = np.array([p["center_x"], p["center_y"]], float)
+                p["contour"] = ((centre + (pts - centre) * scale)
+                                .reshape(-1, 1, 2).astype(np.float32))
 
     @staticmethod
     def _reject_clipped(particles, shape):

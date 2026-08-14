@@ -515,6 +515,19 @@ class MainWindow(QMainWindow):
         self.chk_core.setToolTip("중공 입자 내부의 코어 입자를 감지하고 보유 비율을 계산")
         param_form.addRow(self.chk_core)
 
+        self.chk_sphere_edge = QCheckBox("구(球) 모서리 보정")
+        self.chk_sphere_edge.setChecked(False)
+        self.chk_sphere_edge.setToolTip(
+            "구는 가장자리로 갈수록 두께가 0으로 얇아지므로, 아무리 초점을 맞춰도\n"
+            "경계가 '계단'이 아니라 서서히 사라지는 모양입니다. 밝기 기준으로는\n"
+            "이 지점을 잡을 수 없어 실제보다 1픽셀쯤 작게 나옵니다.\n"
+            "이 옵션은 대비의 제곱이 반지름에 대해 직선이 되는 성질을 이용해\n"
+            "그 직선이 0을 지나는 곳을 외경으로 삼습니다.\n\n"
+            "구·중공 입자에서는 오차가 -1.6~-3.1%에서 ±0.9% 이내로 줄어듭니다.\n"
+            "다만 두께가 일정한 원반형(계단 경계) 입자는 1픽셀쯤 크게 나옵니다.\n"
+            "실제 TEM 입자는 구이므로 대개 켜는 쪽이 맞습니다.")
+        param_form.addRow(self.chk_sphere_edge)
+
         self.chk_edge_auto = QCheckBox("경계 자동 판단")
         self.chk_edge_auto.setChecked(True)
         self.chk_edge_auto.setToolTip(
@@ -722,7 +735,8 @@ class MainWindow(QMainWindow):
             analyzer = ParticleAnalyzer(
                 nm_per_px=self.nm_per_px,
                 edge_level=("auto" if self.chk_edge_auto.isChecked()
-                            else self.spin_edge.value() / 100.0))
+                            else self.spin_edge.value() / 100.0),
+                sphere_edge=self.chk_sphere_edge.isChecked())
             self.particles = analyzer.analyze(
                 self.original_image,
                 min_area_px=self.spin_min_area.value(),
