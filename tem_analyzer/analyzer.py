@@ -1061,6 +1061,12 @@ class ParticleAnalyzer:
                 - d2 * np.sqrt(max(r2 * r2 - d2 * d2, 0)))
         return float(area / (np.pi * small * small))
 
+    #: How much better outlined one of two overlapping circles must be before
+    #: that settles which is the particle, ahead of how confident each fit was.
+    #: Below it the two are outlined about equally and the confidence tier is
+    #: the better tie-break.
+    RING_EVIDENCE_MARGIN = 0.15
+
     @staticmethod
     def _ring_evidence(blurred, cx, cy, radius, n_angles=48):
         """Fraction of directions where a dark ring sits at the boundary.
@@ -1118,20 +1124,35 @@ class ParticleAnalyzer:
                                    p["center_y"] - q["center_y"]))
                 if ParticleAnalyzer.overlap_fraction(d, p["radius_px"], q["radius_px"]) <= thresh:
                     continue
-                if p.get("approx") != q.get("approx"):
-                    loser = p if p.get("approx") else q
-                    loser["excluded"] = True
-                    loser["approx"] = False
-                elif blurred is not None:
-                    # Equally confident, so ask which one is actually outlined.
-                    # Keeping both was inflating the count: a phantom in the gap
-                    # between particles can pass every test applied to it alone,
-                    # and only loses when set against the particle it overlaps.
+                evidence = None
+                if blurred is not None:
                     for cand in (p, q):
                         if "ring_evidence" not in cand:
                             cand["ring_evidence"] = ParticleAnalyzer._ring_evidence(
                                 blurred, cand["center_x"], cand["center_y"],
                                 cand["radius_px"])
+                    evidence = abs(p["ring_evidence"] - q["ring_evidence"])
+
+                # Which one is actually outlined decides it, whenever the two
+                # differ clearly enough to say. Deciding by confidence tier
+                # first gets it backwards exactly where it matters: a real
+                # particle half-hidden by its neighbour is marked approximate
+                # *because* it is half-hidden, and a phantom sitting in the gap
+                # can be fitted confidently to pieces of the rims around it. On
+                # a real micrograph that pairing threw away a particle outlined
+                # on 94% of its circumference and kept the phantom overlapping
+                # it, outlined on 56%. The tier only breaks ties now.
+                if evidence is not None and evidence >= ParticleAnalyzer.RING_EVIDENCE_MARGIN:
+                    loser = p if p["ring_evidence"] < q["ring_evidence"] else q
+                    winner = q if loser is p else p
+                    loser["excluded"] = True
+                    loser["approx"] = False
+                    winner["overlap"] = True
+                elif p.get("approx") != q.get("approx"):
+                    loser = p if p.get("approx") else q
+                    loser["excluded"] = True
+                    loser["approx"] = False
+                elif blurred is not None:
                     loser = p if p["ring_evidence"] < q["ring_evidence"] else q
                     winner = q if loser is p else p
                     loser["excluded"] = True
