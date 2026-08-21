@@ -22,6 +22,25 @@ the interior over the whole disc excluded every one of them, and the fix was to
 read the ring just inside the wall, which is the part cored and hollow
 particles have in common.
 
+That fix is not complete, and the limit is worth knowing before someone tries
+again. On a real yolk-shell sample the cores fill nearly the whole interior
+rather than sitting small in the middle, so they darken the ring just inside
+the wall too: six of its seven cored particles are still excluded there. The
+obvious repair - exempting any candidate darker inside than at its own boundary,
+since a gap or an overlap lens holds less material than the walls around it and
+must read brighter - does recover them, and costs more than it gives: two of
+nine synthetic cored particles are then kept with the circle sitting on the
+core rather than the shell, measured at 57% of true size, which corrupts a size
+distribution far worse than losing a particle does. Four ways to tell those two
+cases apart were measured and none separates them - the second concentric ring
+(ratio 1.96 vs 2.07), its depth, the linearity of the edge fit, and how far the
+cavity recovers from core to wall (0.48-0.59 against 0.09-0.22 on the synthetic
+fixture, but the real cores are large enough to sit in the same range). A
+circle on the shell of a particle whose core fills it looks like a circle on a
+core. Excluding them is the safer error: they are a small minority and their
+size is close to the population median (99 nm against 95), so the distribution
+barely moves.
+
 Result: the outer diameter comes out 1-3% small across a four-fold range of
 particle size, with no false detections. The bias is the half-height criterion
 sitting just inside the true edge on a blurred flank, and it shrinks as the
