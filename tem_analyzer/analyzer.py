@@ -1483,6 +1483,12 @@ class ParticleAnalyzer:
             return cx, cy, r
         return int(round(ux)), int(round(uy)), int(round(rad))
 
+    #: How much of the background ring may be occupied by neighbours before the
+    #: sphere-edge extrapolation declines to run. It needs real background to
+    #: extrapolate to; a neighbour's interior in its place inflates the answer
+    #: by an order of magnitude more than the correction is worth.
+    SPHERE_MAX_CROWDING = 0.25
+
     #: Where on the edge profile the extrapolation is fitted, as a share of the
     #: edge's own contrast. Chosen by sweeping: further out the imaging blur
     #: bends the curve and the answer drifts with it (0.20-0.60 moves 1.3 px
@@ -1569,10 +1575,31 @@ class ParticleAnalyzer:
         frame, too little contrast - keeps the radius it had.
         """
         blurred = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.2)
-        for p in particles:
-            if p.get("excluded"):
-                continue
+        live = [p for p in particles if not p.get("excluded")]
+        ang = np.linspace(0, 2 * np.pi, 72, endpoint=False)
+        cos_a, sin_a = np.cos(ang), np.sin(ang)
+        for p in live:
             r0 = p["radius_px"]
+            # The extrapolation reads its background from a ring outside the
+            # particle. In a packed field that ring is inside the neighbours -
+            # 63% of it on the median particle of a real micrograph - so the
+            # level it calls background is a neighbour's interior, the fitted
+            # line is too shallow, and its root lands far outside the particle.
+            # On three real samples that inflated every diameter by about 18%,
+            # against the 2% the physics predicts, and it went unnoticed
+            # because the fixture this was built on has particles standing
+            # apart. Where there is no clear background there is nothing to
+            # extrapolate to, so the particle keeps the traced boundary.
+            xs = p["center_x"] + 1.30 * r0 * cos_a
+            ys = p["center_y"] + 1.30 * r0 * sin_a
+            crowded = np.zeros(len(ang), bool)
+            for q in live:
+                if q is p:
+                    continue
+                crowded |= (np.hypot(xs - q["center_x"], ys - q["center_y"])
+                            <= q["radius_px"])
+            if crowded.mean() > self.SPHERE_MAX_CROWDING:
+                continue
             r = self._sphere_edge_radius(blurred, p["center_x"], p["center_y"], r0)
             if r is None or not (0.7 * r0 <= r <= 1.4 * r0):
                 continue
