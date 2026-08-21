@@ -278,6 +278,7 @@ class ParticleAnalyzer:
             particles = kept
 
         self._reject_implausible_interiors(particles, analysis_region)
+        self._recentre_on_ring(particles, analysis_region)
         if self.sphere_edge:
             self._refine_by_sphere_edge(particles, analysis_region)
         self._reject_clipped(particles, analysis_region.shape)
@@ -1615,6 +1616,90 @@ class ParticleAnalyzer:
                 centre = np.array([p["center_x"], p["center_y"]], float)
                 p["contour"] = ((centre + (pts - centre) * scale)
                                 .reshape(-1, 1, 2).astype(np.float32))
+
+    #: A circle may be moved onto its ring by at most this share of its radius.
+    #: Beyond it the ring being fitted is more likely a neighbour's than its
+    #: own, and moving there would swap one particle for another.
+    RECENTRE_MAX_MOVE = 0.25
+
+    #: Below this the move is inside the noise of the fit and not worth making.
+    RECENTRE_MIN_MOVE = 0.06
+
+    @staticmethod
+    def _recentre_on_ring(particles, gray, n_angles=180):
+        """Put each circle back on the ring it is supposed to be on.
+
+        The boundary is fitted to points traced outward from a seed, and a seed
+        that starts off-centre traces a boundary made partly of its own rim and
+        partly of a neighbour's. The circle through that mixture is displaced,
+        and it stays displaced however good the fit was, because the fit is
+        faithful to points that were wrong. Seeds are already re-centred before
+        tracing; this catches what survives, and on real micrographs that was
+        one detection in seven sitting more than 10% of a radius off its
+        particle - the thing a reader notices first, because a circle a tenth
+        out of place visibly bulges past the particle on one side.
+
+        The ring is found independently of any of that: along each ray, the
+        darkest point that dips on both sides. Only the centre moves. The
+        radius is left alone because it was measured against a criterion this
+        does not reproduce, and re-deriving it here would silently replace the
+        boundary rule with a darkest-point one.
+        """
+        live = [p for p in particles if not p.get("excluded")]
+        if not live:
+            return
+        blurred = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.5)
+        h, w = gray.shape
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        fracs = np.arange(0.78, 1.26, 0.02)
+        for p in live:
+            cx, cy, r = p["center_x"], p["center_y"], p["radius_px"]
+            pts = []
+            for a in angles:
+                xs = (cx + r * fracs * np.cos(a)).astype(int)
+                ys = (cy + r * fracs * np.sin(a)).astype(int)
+                if not ((xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)).all():
+                    continue
+                prof = blurred[ys, xs]
+                k = int(np.argmin(prof))
+                if k == 0 or k == len(prof) - 1:
+                    continue
+                if min(prof[:k].max() - prof[k], prof[k:].max() - prof[k]) < 8:
+                    continue
+                rr = r * fracs[k]
+                pts.append((cx + rr * np.cos(a), cy + rr * np.sin(a)))
+            if len(pts) < n_angles * 0.22:
+                continue
+            P = np.array(pts)
+            ux = uy = rad = None
+            resid = None
+            for _ in range(3):
+                A = np.column_stack([2 * P[:, 0], 2 * P[:, 1], np.ones(len(P))])
+                sol, *_ = np.linalg.lstsq(A, P[:, 0] ** 2 + P[:, 1] ** 2, rcond=None)
+                ux, uy = float(sol[0]), float(sol[1])
+                rad = float(np.sqrt(sol[2] + ux * ux + uy * uy))
+                resid = np.abs(np.hypot(P[:, 0] - ux, P[:, 1] - uy) - rad)
+                keep = resid < 2.5 * np.median(resid) + 1
+                if keep.all():
+                    break
+                P = P[keep]
+                if len(P) < n_angles * 0.22:
+                    break
+            if rad is None or rad <= 0:
+                continue
+            rms = float(np.median(resid)) / rad
+            move = np.hypot(ux - cx, uy - cy) / max(r, 1)
+            if rms > 0.08 or not (ParticleAnalyzer.RECENTRE_MIN_MOVE < move
+                                  <= ParticleAnalyzer.RECENTRE_MAX_MOVE):
+                continue
+            dx, dy = int(round(ux)) - cx, int(round(uy)) - cy
+            p["center_x"] += dx
+            p["center_y"] += dy
+            if p.get("contour") is not None:
+                c = p["contour"].reshape(-1, 2).astype(np.float32)
+                c[:, 0] += dx
+                c[:, 1] += dy
+                p["contour"] = c.reshape(-1, 1, 2)
 
     @staticmethod
     def _reject_clipped(particles, shape):
