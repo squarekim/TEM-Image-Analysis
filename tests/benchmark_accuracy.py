@@ -38,6 +38,13 @@ from tests.generate_test_image import generate_tem_image  # noqa: E402
 from tests.generate_touching_image import generate_touching_image  # noqa: E402
 
 
+def visible_arc(cx, cy, r, w, h, n=180):
+    """Share of a circle's circumference that lies inside the frame."""
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    xs, ys = cx + r * np.cos(a), cy + r * np.sin(a)
+    return float(np.mean((xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)))
+
+
 def match(truth, found, tol_factor=0.6):
     """Pair each true particle with the nearest unclaimed detection."""
     pairs, used = [], set()
@@ -73,13 +80,14 @@ def score(name, path, truth, hollow):
     particles = analyzer.analyze(image, min_area_px=100,
                                  circularity_thresh=0.5, hollow=hollow)
     valid = [p for p in particles if not p.get("excluded")]
-    # A particle the frame cuts through has no determinable diameter, so the
-    # analyzer excludes it by design. Scoring it as a miss would mark the
-    # analyzer down for obeying its own contract, and would reward a version
-    # that reported an extrapolated size instead.
+    # A particle the frame cuts too deeply has no determinable diameter and
+    # the analyzer excludes it by design, so scoring it as a miss would mark
+    # the analyzer down for obeying its own contract. The line is the same one
+    # the analyzer draws - two thirds of the circumference inside the frame -
+    # so that a particle it measures is a particle this expects.
     h, w = image.shape[:2]
     truth = [(x, y, r) for x, y, r in truth
-             if x - r >= 0 and y - r >= 0 and x + r <= w and y + r <= h]
+             if visible_arc(x, y, r, w, h) >= ParticleAnalyzer.MIN_VISIBLE_ARC]
     pairs, spurious = match(truth, valid)
     if not pairs:
         print(f"{name}: no matches")

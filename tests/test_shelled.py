@@ -54,6 +54,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tem_analyzer.analyzer import ParticleAnalyzer, load_image  # noqa: E402
+from tests.benchmark_accuracy import visible_arc  # noqa: E402
 from tests.generate_shelled_image import generate_shelled_image  # noqa: E402
 
 SIZE = 1024
@@ -99,7 +100,7 @@ def cored_case():
         truth = generate_shelled_image(path, radius=70, count=32, seed=11,
                                        cored=fraction, size=SIZE)
         truth = [(x, y, r, c) for x, y, r, c in truth
-                 if x - r >= 0 and y - r >= 0 and x + r <= SIZE and y + r <= SIZE]
+                 if visible_arc(x, y, r, SIZE, SIZE) >= ParticleAnalyzer.MIN_VISIBLE_ARC]
         valid = [p for p in ParticleAnalyzer().analyze(
             load_image(path), min_area_px=100, circularity_thresh=0.5,
             hollow=True, detect_cores=True) if not p.get("excluded")]
@@ -148,7 +149,7 @@ def sphere_edge_case():
         truth = generate_shelled_image(path, radius=radius, shell_frac=shell,
                                        count=40 if radius < 100 else 16, size=SIZE)
         truth = [(x, y, r) for x, y, r, _ in truth
-                 if x - r >= 0 and y - r >= 0 and x + r <= SIZE and y + r <= SIZE]
+                 if visible_arc(x, y, r, SIZE, SIZE) >= ParticleAnalyzer.MIN_VISIBLE_ARC]
         row = []
         for flag in (False, True):
             valid = [p for p in ParticleAnalyzer(sphere_edge=flag).analyze(
@@ -194,10 +195,10 @@ def main():
     for label, radius, shell, count in CASES:
         truth = generate_shelled_image(path, radius=radius, shell_frac=shell,
                                        count=count, size=SIZE)
-        # A particle the frame cuts through has no determinable diameter and is
-        # excluded by design, so it cannot count against recall.
+        # Scored at the same line the analyzer draws: a particle with two
+        # thirds of its circumference inside the frame is measurable.
         truth = [(x, y, r) for x, y, r, _ in truth
-                 if x - r >= 0 and y - r >= 0 and x + r <= SIZE and y + r <= SIZE]
+                 if visible_arc(x, y, r, SIZE, SIZE) >= ParticleAnalyzer.MIN_VISIBLE_ARC]
         errors, matched, spurious = measure(path, truth)
         if not errors:
             print(f"  FAIL  {label}: 매칭된 입자 없음")
