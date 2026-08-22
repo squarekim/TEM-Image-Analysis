@@ -765,6 +765,11 @@ class MainWindow(QMainWindow):
             msg += f" (근사 {n_approx}개 포함)"
         if n_exc:
             msg += f", 판별불가 {n_exc}개 제외"
+        n_aside = sum(1 for p in self.particles
+                      if p.get("unoutlined") and not p.get("restored"))
+        if n_aside:
+            msg += (f"  |  확인 필요 {n_aside}개 (주황색) - 둘레가 덜 보여 "
+                    "유령과 구분되지 않음, 클릭하면 포함")
         n_overlap, _ = self._overlapping_pairs()
         if n_overlap:
             msg += f"  |  겹치는 검출 {n_overlap}쌍 (보라색) - 중복 여부 확인 필요"
@@ -817,7 +822,15 @@ class MainWindow(QMainWindow):
             cx, cy = p["center_x"] * scale, p["center_y"] * scale
             r = int(p["radius_px"]) * scale
             excluded = p.get("excluded", False)
-            if excluded:
+            if excluded and p.get("unoutlined") and not p.get("restored"):
+                # Not deleted, offered. The measurement that finds phantoms -
+                # how much of the circumference carries a dark ring - cannot
+                # tell a phantom from a real particle whose neighbours hide
+                # most of its outline; the two overlap completely on every
+                # figure measured. So these are set aside rather than thrown
+                # away, and a click puts one back.
+                color = (255, 170, 60)
+            elif excluded:
                 color = (0, 0, 255)
             elif p.get("overlap") or id(p) in overlapping:
                 color = (255, 0, 255)
@@ -906,7 +919,29 @@ class MainWindow(QMainWindow):
                               False, color, thickness)
 
     def _on_image_click(self, ox, oy):
-        if not self.particles or "has_core" not in (self.particles[0] if self.particles else {}):
+        if not self.particles:
+            return
+        # A set-aside particle is put back, or a restored one set aside again.
+        # This takes precedence over the core toggle: those circles are drawn
+        # in their own colour and clicking one can only mean the one thing.
+        aside, aside_d = None, None
+        for p in self.particles:
+            if not p.get("unoutlined"):
+                continue
+            d = np.hypot(p["center_x"] - ox, p["center_y"] - oy)
+            if d <= p["radius_px"] and (aside_d is None or d < aside_d):
+                aside, aside_d = p, d
+        if aside is not None:
+            restored = not aside.get("restored", False)
+            aside["restored"] = restored
+            aside["excluded"] = not restored
+            self._draw_results()
+            self._update_stats(ParticleAnalyzer.compute_statistics(self.particles))
+            self.statusBar().showMessage(
+                "확인 필요 입자를 " + ("포함했습니다" if restored else "다시 제외했습니다"))
+            return
+
+        if "has_core" not in (self.particles[0] if self.particles else {}):
             return
         best = None
         best_d = None
