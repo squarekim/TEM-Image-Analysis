@@ -284,6 +284,9 @@ class ParticleAnalyzer:
         self._reject_clipped(particles, analysis_region.shape)
         self._resolve_overlaps(particles, cv2.GaussianBlur(analysis_region, (0, 0), 1.5))
         self._reject_buried(particles)
+        self._reject_unoutlined(particles,
+                                cv2.GaussianBlur(analysis_region, (0, 0), 1.5))
+        self._reject_annotated(particles, analysis_region)
 
         if measure_shell:
             blur3 = cv2.GaussianBlur(analysis_region, (3, 3), 0)
@@ -1721,6 +1724,121 @@ class ParticleAnalyzer:
                 c[:, 0] += dx
                 c[:, 1] += dy
                 p["contour"] = c.reshape(-1, 1, 2)
+
+    #: A particle is outlined all the way round; a phantom lying in the space
+    #: between particles borrows pieces of its neighbours' rims and is outlined
+    #: over part of its circumference. On real micrographs every detection a
+    #: reader marked as "nothing is there" measured 0.73 or below, against a
+    #: median of 0.92 for the ones they accepted.
+    MIN_OUTLINED = 0.75
+
+    #: The rule only applies to images whose particles are outlined at all.
+    #: Measured per image, this is 0.91-1.00 where they are and 0.00 where the
+    #: particles are dark discs on a bright ground, whose darkest point along
+    #: any ray is inside them rather than at the boundary. Nothing in between
+    #: was observed, so the gate is not delicate.
+    OUTLINED_FIELD = 0.80
+
+    @staticmethod
+    def _reject_unoutlined(particles, blurred):
+        """Exclude circles that are not outlined most of the way round.
+
+        The same measurement already settles which of two overlapping circles
+        is the particle. It was never applied to a circle standing on its own,
+        and a phantom in the gap between three particles has nothing to be set
+        against - it passes every test applied to it alone. Asking it directly
+        catches all seventeen that a reader marked as phantoms across four real
+        micrographs, at the cost of 7% of the detections they had accepted,
+        some of which are errors they did not mark.
+
+        It is asked only where being outlined means something. On a dark disc
+        on a bright ground the darkest point along a ray is the middle of the
+        particle, so the measure reads zero for every particle and applying it
+        would empty the image - which it did, on three fixtures, before this
+        was gated.
+        """
+        live = [p for p in particles if not p.get("excluded")]
+        if len(live) < 5:
+            return
+        for p in live:
+            if "ring_evidence" not in p:
+                p["ring_evidence"] = ParticleAnalyzer._ring_evidence(
+                    blurred, p["center_x"], p["center_y"], p["radius_px"])
+        if np.median([p["ring_evidence"] for p in live]) < ParticleAnalyzer.OUTLINED_FIELD:
+            return
+        for p in live:
+            if p["ring_evidence"] < ParticleAnalyzer.MIN_OUTLINED:
+                p["excluded"] = True
+                p["approx"] = False
+                p["unoutlined"] = True
+
+    #: How much of a particle may lie under the scale bar and its lettering
+    #: before it is dropped. A particle grazing the annotation is still
+    #: measurable; one behind it is not, and neither its edge nor its interior
+    #: means anything there.
+    MAX_ANNOTATED = 0.15
+
+    @staticmethod
+    def _annotation_box(gray):
+        """Where the scale bar and its caption sit, when they are drawn over
+        the micrograph rather than in a black strip below it.
+
+        The bar is found by shape rather than brightness: a solid, very bright
+        rectangle at least 60 px wide and four times wider than it is tall.
+        Brightness alone cannot find it, because the gaps between particles in
+        these samples reach 254 as well. The caption sits directly above the
+        bar and scales with it, so the box extends upward by a fraction of the
+        bar's length. Returns None when there is no such bar.
+        """
+        h, w = gray.shape
+        top = int(h * 0.75)
+        mask = (gray[top:, :] > 235).astype(np.uint8)
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        best = None
+        for i in range(1, n):
+            x, y, bw, bh, area = stats[i]
+            if bw < 60 or bh < 1 or bw / max(bh, 1) < 4:
+                continue
+            if area < bw * bh * 0.6:
+                continue
+            if best is None or bw > best[2]:
+                best = (x, y, bw, bh)
+        if best is None:
+            return None
+        x, y, bw, _ = best
+        pad = int(bw * 0.08)
+        return (max(0, x - pad), max(0, top + y - int(bw * 0.45)),
+                min(w, x + bw + pad), h)
+
+    @staticmethod
+    def _reject_annotated(particles, gray):
+        """Drop particles the scale bar or its caption is drawn over."""
+        box = ParticleAnalyzer._annotation_box(gray)
+        if box is None:
+            return
+        x0, y0, x1, y1 = box
+        for p in particles:
+            if p.get("excluded"):
+                continue
+            cx, cy, r = p["center_x"], p["center_y"], p["radius_px"]
+            if cx + r < x0 or cx - r > x1 or cy + r < y0 or cy - r > y1:
+                continue
+            size = 2 * int(round(r)) + 1
+            disc = np.zeros((size, size), np.uint8)
+            cv2.circle(disc, (int(round(r)), int(round(r))), int(round(r)), 1, -1)
+            ann = np.zeros_like(disc)
+            ax0 = max(0, x0 - (cx - int(round(r))))
+            ay0 = max(0, y0 - (cy - int(round(r))))
+            ax1 = min(size, x1 - (cx - int(round(r))))
+            ay1 = min(size, y1 - (cy - int(round(r))))
+            if ax1 <= ax0 or ay1 <= ay0:
+                continue
+            ann[ay0:ay1, ax0:ax1] = 1
+            hidden = np.count_nonzero(disc & ann) / max(np.count_nonzero(disc), 1)
+            if hidden > ParticleAnalyzer.MAX_ANNOTATED:
+                p["excluded"] = True
+                p["approx"] = False
+                p["annotated"] = True
 
     @staticmethod
     def _reject_clipped(particles, shape):
