@@ -575,6 +575,7 @@ class MainWindow(QMainWindow):
         self.lbl_d90 = QLabel("-")
         self.lbl_core = QLabel("-")
         self.lbl_shell = QLabel("-")
+        self.lbl_defect = QLabel("-")
         self.lbl_porosity = QLabel("-")
         stats_form.addRow("입자 수:", self.lbl_count)
         stats_form.addRow("평균 직경:", self.lbl_mean)
@@ -586,6 +587,7 @@ class MainWindow(QMainWindow):
         stats_form.addRow("D90:", self.lbl_d90)
         stats_form.addRow("코어 보유율:", self.lbl_core)
         stats_form.addRow("쉘 두께:", self.lbl_shell)
+        stats_form.addRow("불량 (코어잔존/파손):", self.lbl_defect)
         stats_form.addRow("공극률:", self.lbl_porosity)
         stats_group.setLayout(stats_form)
         right_layout.addWidget(stats_group)
@@ -770,6 +772,10 @@ class MainWindow(QMainWindow):
         if n_aside:
             msg += (f"  |  확인 필요 {n_aside}개 (주황색) - 둘레가 덜 보여 "
                     "유령과 구분되지 않음, 클릭하면 포함")
+        n_defect = sum(1 for p in valid if p.get("defect"))
+        if n_defect:
+            msg += (f"  |  불량 {n_defect}개 (파란 안쪽 원) - 코어 잔존 또는 "
+                    "내부 파손, 크기는 측정됨")
         n_overlap, _ = self._overlapping_pairs()
         if n_overlap:
             msg += f"  |  겹치는 검출 {n_overlap}쌍 (보라색) - 중복 여부 확인 필요"
@@ -829,7 +835,7 @@ class MainWindow(QMainWindow):
                 # most of its outline; the two overlap completely on every
                 # figure measured. So these are set aside rather than thrown
                 # away, and a click puts one back.
-                color = (255, 170, 60)
+                color = (60, 170, 255)
             elif excluded:
                 color = (0, 0, 255)
             elif p.get("overlap") or id(p) in overlapping:
@@ -857,6 +863,13 @@ class MainWindow(QMainWindow):
             if p.get("has_core"):
                 cv2.drawMarker(display, (cx, cy), (0, 165, 255),
                                cv2.MARKER_CROSS, max(10, r // 3), thickness)
+            if p.get("defect"):
+                # Measured and counted like any other particle - the ring is a
+                # label, not a verdict on the measurement - so it goes inside
+                # the boundary rather than replacing its colour, which still
+                # says how well the diameter is known.
+                cv2.circle(display, (cx, cy), max(2, int(r * 0.82)),
+                           (255, 60, 60), max(1, thickness - 1))
             txt = str(num)
             pos = (cx - 8 * len(txt), cy - 6)
             font_scale = 0.45 + 0.1 * scale
@@ -1010,6 +1023,12 @@ class MainWindow(QMainWindow):
                 f"{stats['core_count']}/{stats['count']} ({stats['core_ratio']*100:.1f}%)")
         else:
             self.lbl_core.setText("-")
+        if stats.get("defect_count"):
+            self.lbl_defect.setText(
+                f"{stats['defect_count']}/{stats['count']} "
+                f"({stats['defect_ratio'] * 100:.1f}%)")
+        else:
+            self.lbl_defect.setText("0")
         if "shell_mean" in stats:
             self.lbl_shell.setText(
                 f"{stats['shell_mean']:.2f} ± {stats['shell_std']:.2f} {u}"
@@ -1037,6 +1056,9 @@ class MainWindow(QMainWindow):
             headers += ["쉘 두께", "공극률(%)"]
         if has_core_col:
             headers += ["코어"]
+        has_defect_col = any(p.get("defect") for p in particles)
+        if has_defect_col:
+            headers += ["불량"]
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setSortingEnabled(False)
@@ -1060,6 +1082,10 @@ class MainWindow(QMainWindow):
                 col += 2
             if has_core_col:
                 self.table.setItem(i, col, QTableWidgetItem("유" if p["has_core"] else "무"))
+                col += 1
+            if has_defect_col:
+                self.table.setItem(i, col,
+                                   QTableWidgetItem("불량" if p.get("defect") else ""))
         self.table.setSortingEnabled(True)
 
     def _update_histogram(self):
@@ -1092,6 +1118,7 @@ class MainWindow(QMainWindow):
             headers += [f"Inner Diameter ({u})", f"Shell Thickness ({u})", "Porosity"]
         if has_core:
             headers += ["Has Core"]
+        headers += ["Defect"]
         ws_data.append(headers)
         for i, p in enumerate(particles):
             row = [i + 1, p["diameter"], p["radius_px"] * 2, p["area"],
@@ -1102,6 +1129,7 @@ class MainWindow(QMainWindow):
                         p.get("porosity")]
             if has_core:
                 row += ["Y" if p["has_core"] else "N"]
+            row += ["Y" if p.get("defect") else "N"]
             ws_data.append(row)
 
         ws_stats = wb.create_sheet("Statistics")
@@ -1124,6 +1152,9 @@ class MainWindow(QMainWindow):
         if "core_ratio" in stats:
             ws_stats.append(["Core Count", stats["core_count"], ""])
             ws_stats.append(["Core Ratio", stats["core_ratio"], ""])
+        if "defect_count" in stats:
+            ws_stats.append(["Defect Count", stats["defect_count"], ""])
+            ws_stats.append(["Defect Ratio", stats["defect_ratio"], ""])
 
         if self.nm_per_px:
             ws_stats.append([])

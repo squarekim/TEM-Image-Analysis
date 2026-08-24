@@ -22,24 +22,32 @@ the interior over the whole disc excluded every one of them, and the fix was to
 read the ring just inside the wall, which is the part cored and hollow
 particles have in common.
 
-That fix is not complete, and the limit is worth knowing before someone tries
-again. On a real yolk-shell sample the cores fill nearly the whole interior
-rather than sitting small in the middle, so they darken the ring just inside
-the wall too: six of its seven cored particles are still excluded there. The
-obvious repair - exempting any candidate darker inside than at its own boundary,
-since a gap or an overlap lens holds less material than the walls around it and
-must read brighter - does recover them, and costs more than it gives: two of
-nine synthetic cored particles are then kept with the circle sitting on the
-core rather than the shell, measured at 57% of true size, which corrupts a size
-distribution far worse than losing a particle does. Four ways to tell those two
-cases apart were measured and none separates them - the second concentric ring
-(ratio 1.96 vs 2.07), its depth, the linearity of the edge fit, and how far the
-cavity recovers from core to wall (0.48-0.59 against 0.09-0.22 on the synthetic
-fixture, but the real cores are large enough to sit in the same range). A
-circle on the shell of a particle whose core fills it looks like a circle on a
-core. Excluding them is the safer error: they are a small minority and their
-size is close to the population median (99 nm against 95), so the distribution
-barely moves.
+The rest of that fix took a while to find, and the dead ends are worth knowing.
+On a real yolk-shell sample the cores fill nearly the whole interior rather
+than sitting small in the middle, so they darken the ring just inside the wall
+too, and the cored particles were excluded there anyway. Every attempt to
+rescue them by what is *inside* the circle failed, because inside is where a
+cored particle and an overlap lens look alike: exempting any candidate darker
+inside than at its own boundary recovered them and kept two synthetic ones with
+the circle sitting on the core, measured at 57% of true size, which corrupts a
+distribution far worse than losing a particle does. Four ways to tell those
+apart were measured and none separates them - the second concentric ring (ratio
+1.96 vs 2.07), its depth, the linearity of the edge fit, and how far the cavity
+recovers from core to wall (0.48-0.59 against 0.09-0.22 here, but real cores
+are large enough to sit in the same range).
+
+What works is asking about the *outside* instead. A particle carries its own
+wall the whole way round; an overlap lens carries only the pieces of its
+neighbours' walls that cross it. That measurement (`_ring_evidence`) was
+already trusted for exactly this job elsewhere, and asking it of the dark
+candidates recovers 17 of the 42 the interior rule had dropped on one real
+field, with no false detections on any fixture here.
+
+Cored particles are then labelled rather than dropped - `defect`, counted in
+the statistics - which is what a reader wants from them: a broken or
+incompletely templated particle still has an outer diameter, and how many of
+them there are is itself a result. The label is scored below on ground truth:
+17 of 17 cored particles flagged, none of 60 intact ones.
 
 Result: the outer diameter comes out 1-3% small across a four-fold range of
 particle size, with no false detections. The bias is the half-height criterion
@@ -107,6 +115,7 @@ def cored_case():
 
         found = {True: 0, False: 0}
         total = {True: 0, False: 0}
+        defect = {True: 0, False: 0}
         errors, flagged, used = [], 0, set()
         for tx, ty, tr, cored in truth:
             total[cored] += 1
@@ -121,6 +130,7 @@ def cored_case():
                 continue
             used.add(best)
             found[cored] += 1
+            defect[cored] += bool(valid[best].get("defect"))
             if cored:
                 errors.append((valid[best]["radius_px"] - tr) / tr * 100)
                 flagged += bool(valid[best].get("has_core"))
@@ -128,13 +138,22 @@ def cored_case():
         recall = found[True] / max(total[True], 1) * 100
         plain = found[False] / max(total[False], 1) * 100
         bias = float(np.mean(errors)) if errors else float("nan")
-        ok = recall >= 75.0 and plain >= 90.0 and abs(bias) <= MAX_ERROR_PCT
+        # The defect label has to fire on the particles that have something
+        # inside them and stay quiet on the ones that do not - a count of
+        # defects is only worth reporting if both halves hold.
+        hit = defect[True] / max(found[True], 1) * 100
+        false_alarm = defect[False] / max(found[False], 1) * 100
+        ok = (recall >= 75.0 and plain >= 90.0 and abs(bias) <= MAX_ERROR_PCT
+              and hit >= 80.0 and false_alarm <= 5.0)
         print(f"  {'PASS' if ok else 'FAIL'}  코어 비율 {fraction * 100:3.0f}%   "
               f"코어입자 {found[True]:2d}/{total[True]:<2d} ({recall:3.0f}%)   "
               f"일반 {found[False]:2d}/{total[False]:<2d} ({plain:3.0f}%)   "
-              f"외경 오차 {bias:+5.1f}%   코어로 판정 {flagged}/{found[True]}")
+              f"외경 오차 {bias:+5.1f}%   코어로 판정 {flagged}/{found[True]}   "
+              f"불량 판정 {defect[True]}/{found[True]} (오경보 "
+              f"{defect[False]}/{found[False]})")
         if not ok:
-            failures.append(f"코어 비율 {fraction * 100:.0f}%: 회수 {recall:.0f}%")
+            failures.append(f"코어 비율 {fraction * 100:.0f}%: 회수 {recall:.0f}%, "
+                            f"불량 판정 {hit:.0f}%, 오경보 {false_alarm:.0f}%")
     return failures
 
 

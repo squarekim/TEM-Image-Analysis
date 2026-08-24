@@ -288,6 +288,7 @@ class ParticleAnalyzer:
         self._reject_unoutlined(particles,
                                 cv2.GaussianBlur(analysis_region, (0, 0), 1.5))
         self._reject_annotated(particles, analysis_region)
+        self._flag_defects(particles, analysis_region)
 
         if measure_shell:
             blur3 = cv2.GaussianBlur(analysis_region, (3, 3), 0)
@@ -1645,6 +1646,65 @@ class ParticleAnalyzer:
             p["contour"] = ((centre + (pts - centre) * (r / r0))
                             .reshape(-1, 1, 2).astype(np.float32))
 
+    #: Share of a particle's inside that has to read as solid material before
+    #: it is called defective. Measured on the real yolk-shell micrograph, this
+    #: is 0.00 for half the field and 0.05 at the 95th percentile, then jumps
+    #: to 0.34 at the 97th - an intact shell has nothing inside it at all, so
+    #: there is a wide empty gap to put the line in and its exact place hardly
+    #: matters.
+    DEFECT_DARK_SHARE = 0.20
+
+    def _flag_defects(self, particles, gray):
+        """Mark the particles that have something inside them.
+
+        A template that was never dissolved out, or a shell that collapsed and
+        folded in on itself, leaves solid material in a cavity that should be
+        empty. These are still particles and still have an outer diameter worth
+        measuring - a reader asked for them counted, not dropped - so this only
+        labels them; nothing here excludes anything.
+
+        What it looks for is material, not darkness in general. The whole
+        particle reads darker when it sits on a thicker patch of support film,
+        and the interior of a small particle reads darker than a large one's
+        because the shell it is seen through is the same thickness either way.
+        Neither of those puts a *lump* inside. So the reference is the
+        particle's own interior and its own wall - the share of the inside that
+        is more than halfway down from one to the other - which is a ratio of
+        two levels the particle supplies itself, and so does not move with
+        exposure, magnification, or where on the film it sits.
+        """
+        blurred = cv2.GaussianBlur(gray, (0, 0), 2.0)
+        h, w = blurred.shape
+        angles = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        steps = np.arange(0.80, 1.25, 0.03)
+        for p in particles:
+            p.setdefault("defect", False)
+            if p.get("excluded"):
+                continue
+            cx, cy, r = p["center_x"], p["center_y"], p["radius_px"]
+            xs = np.clip((cx + r * np.outer(cos_a, steps)).astype(int), 0, w - 1)
+            ys = np.clip((cy + r * np.outer(sin_a, steps)).astype(int), 0, h - 1)
+            wall = float(np.median(blurred[ys, xs].min(axis=1)))
+
+            rr = r * 0.65
+            x0, x1 = max(0, int(cx - rr)), min(w, int(cx + rr) + 1)
+            y0, y1 = max(0, int(cy - rr)), min(h, int(cy + rr) + 1)
+            if x1 - x0 < 5 or y1 - y0 < 5:
+                continue
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            inside = blurred[y0:y1, x0:x1][np.hypot(xx - cx, yy - cy) <= rr]
+            if inside.size < 25:
+                continue
+            level = float(np.percentile(inside, 80))
+            # Without a wall to measure against there is no scale to judge a
+            # lump by, and the ratio would be noise divided by noise.
+            if level - wall < 6:
+                continue
+            share = float(np.mean(inside < level - 0.40 * (level - wall)))
+            p["defect_share"] = share
+            p["defect"] = share >= self.DEFECT_DARK_SHARE
+
     #: A wall has to be resolved on this share of the rays before the boundary
     #: is placed by it. Below that the median is taken over too few directions
     #: to be a radius rather than a local reading.
@@ -2032,8 +2092,8 @@ class ParticleAnalyzer:
                 if not dropped[j]:
                     covered[j] = coverage(j)
 
-    @staticmethod
-    def _reject_implausible_interiors(particles, gray, floor=20.0, k=6.0):
+    @classmethod
+    def _reject_implausible_interiors(cls, particles, gray, floor=20.0, k=6.0):
         """Exclude detections whose inside does not look like the other particles'.
 
         A jammed monolayer contains two things that fit a circle well but are
@@ -2080,10 +2140,31 @@ class ParticleAnalyzer:
         centre = np.median(levels)
         mad = np.median(np.abs(levels - centre))
         tol = max(k * mad, floor)
+        ring = cv2.GaussianBlur(gray, (0, 0), 1.5)
         for p, level in zip(candidates, levels):
-            if abs(level - centre) > tol:
-                p["excluded"] = True
-                p["approx"] = False
+            if abs(level - centre) <= tol:
+                continue
+            # A dark reading has two causes and they need opposite answers.
+            # The overlap lens between two particles is dark because two walls
+            # are stacked there, and it is not a particle. A particle whose
+            # template was never removed, or whose shell collapsed inward, is
+            # dark because there is material inside it - and it *is* a particle,
+            # one the reader wants counted and measured. Earlier attempts to
+            # separate them by what is inside the circle all failed, because
+            # inside is where the two look alike (see test_shelled).
+            #
+            # What differs is outside: a particle carries its own wall the whole
+            # way round, a lens carries only the pieces of its neighbours' walls
+            # that happen to cross it. That measurement is already trusted for
+            # exactly this job elsewhere in the pipeline, so it is asked here
+            # too - but only of the dark ones. A bright reading means a gap
+            # between particles, and a gap has no defensible reading at all.
+            if level < centre and cls._ring_evidence(
+                    ring, p["center_x"], p["center_y"], p["radius_px"]) >= cls.MIN_OUTLINED:
+                p["dark_interior"] = True
+                continue
+            p["excluded"] = True
+            p["approx"] = False
 
     @staticmethod
     def _smooth_radii(r_ang, win=9):
@@ -2652,6 +2733,9 @@ class ParticleAnalyzer:
             "excluded": excluded_count,
             "approx": sum(1 for p in particles if p.get("approx")),
         }
+        defect_count = sum(1 for p in particles if p.get("defect"))
+        stats["defect_count"] = defect_count
+        stats["defect_ratio"] = defect_count / len(particles)
         shelled = [p for p in particles if p.get("shell_thickness") is not None]
         if shelled:
             stats["shell_count"] = len(shelled)
