@@ -9,8 +9,8 @@ Two fixtures are at their floor rather than waiting to be improved, and the
 evidence is recorded here so the next person does not spend the afternoon
 finding it again:
 
-  hard    4.7% over 15 of its 18 particles, and nearly all of it is the three
-          or four of radius 6-9 measured about 20% large. They are below the
+  hard    1.9% over 15 of its 18 particles, and nearly all of it is the three
+          or four of radius 6-9 measured about 8% large. They are below the
           seed search, and they cannot be brought into it: the octave scan
           needs three circles to call a band, and Hough finds one of the four
           at param2=30 and still only one at param2=15, by which point four
@@ -22,7 +22,7 @@ finding it again:
           order is right - on real fields it recovers particles the rule was
           throwing out for having no ring on a circumference that was in the
           wrong place - and it costs one particle at the detection limit here,
-          while improving what the rest of the fixture measures (6.6% -> 4.7%).
+          while improving what the rest of the fixture measures.
   hollow  2.0%, of which the bias is -1.1% (-0.34 px) and the rest is scatter
           between particles, 4.1%. That is measurement noise on individual
           boundaries, not a systematic error with a cause to remove.
