@@ -199,12 +199,47 @@ class ParticleAnalyzer:
         #: Place the boundary by extrapolating the sphere's own edge profile
         #: rather than by a brightness threshold. See `_sphere_edge_radius`.
         self.sphere_edge = bool(sphere_edge)
+        #: Optional callback(fraction, label) for a progress gauge. A dense
+        #: field takes tens of seconds and the caller (the GUI) otherwise looks
+        #: frozen; this lets it draw a bar. It is advisory only - the numbers
+        #: are approximate and a callback that raises is dropped, never allowed
+        #: to interrupt the analysis.
+        self._progress = None
+
+    def _report(self, frac, label=None):
+        if self._progress is None:
+            return
+        if label is not None:
+            self._progress_label = label
+        try:
+            self._progress(float(min(1.0, max(0.0, frac))),
+                           getattr(self, "_progress_label", ""))
+        except Exception:
+            self._progress = None
+
+    def _tick(self, window, i, n, label=None):
+        """Report progress i/n within a (lo, hi) fraction window."""
+        if self._progress is None or window is None:
+            return
+        lo, hi = window
+        self._report(lo + (hi - lo) * (min(i, n) / max(1, n)), label)
 
     def analyze(self, image, min_area_px=100, max_area_px=None,
                 circularity_thresh=0.5, use_watershed=True, hollow=False,
-                detect_cores=False, measure_shell=False):
+                detect_cores=False, measure_shell=False, progress=None):
+        self._progress = progress
+        try:
+            return self._analyze(image, min_area_px, max_area_px, circularity_thresh,
+                                 use_watershed, hollow, detect_cores, measure_shell)
+        finally:
+            self._report(1.0, "완료")
+            self._progress = None
+
+    def _analyze(self, image, min_area_px, max_area_px, circularity_thresh,
+                 use_watershed, hollow, detect_cores, measure_shell):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
+        self._report(0.0, "전처리")
         cutoff = self._find_scalebar_top(gray)
         analysis_region = gray[:cutoff, :]
         scalebar_rect = self._find_scalebar_rect(gray) if cutoff >= h else None
@@ -250,7 +285,9 @@ class ParticleAnalyzer:
         for p in particles:
             p.setdefault("excluded", False)
             p.setdefault("approx", False)
-        hough_particles = self._detect_hough(analysis_region, min_area_px)
+        self._report(0.08, "입자 검출")
+        hough_particles = self._detect_hough(analysis_region, min_area_px,
+                                             pw=(0.08, 0.36))
         particles = self._merge_detections(hough_particles, particles)
 
         # Shell-enclosed interiors take precedence over both ray-based paths.
@@ -262,6 +299,7 @@ class ParticleAnalyzer:
         # way owns its boundary by construction. On images without bright
         # enclosed interiors (solid particles on a bright background) the path
         # finds nothing and changes nothing.
+        self._report(0.36, "내부 검출")
         enclosed = self._detect_enclosed(analysis_region, min_area_px)
         particles = self._merge_detections(enclosed, particles)
 
@@ -284,9 +322,13 @@ class ParticleAnalyzer:
         # thrown out with the phantoms. Correcting the circle first cost
         # nothing - the corrections only move circles, they do not create them -
         # and recovered particles a reader had marked as missed.
-        self._recentre_on_ring(particles, analysis_region)
+        self._report(0.40, "중심 보정")
+        self._recentre_on_ring(particles, analysis_region, pw=(0.40, 0.48))
+        self._report(0.48, "크기 보정")
         self._resize_by_ring(particles, analysis_region)
-        self._snap_to_wall(particles, analysis_region)
+        self._report(0.52, "경계 정렬")
+        self._snap_to_wall(particles, analysis_region, pw=(0.52, 0.82))
+        self._report(0.82, "판별")
         self._reject_implausible_interiors(particles, analysis_region)
         if self.sphere_edge:
             self._refine_by_sphere_edge(particles, analysis_region)
@@ -303,13 +345,15 @@ class ParticleAnalyzer:
         # does not work either, because at that point the field is still full
         # of candidates that will be rejected, and one of them is sitting on
         # the dark particle; it looks covered right up until it is not.
+        self._report(0.90, "누락 입자 탐색")
         extra = self._detect_dark_bodies(analysis_region, particles)
         if extra:
             particles = particles + extra
             self._resize_by_ring(particles, analysis_region)
-            self._snap_to_wall(particles, analysis_region)
+            self._snap_to_wall(particles, analysis_region, pw=(0.90, 0.94))
             self._reject_clipped(particles, analysis_region.shape)
             self._reject_annotated(particles, analysis_region)
+        self._report(0.94, "마무리")
         self._flag_defects(particles, analysis_region)
 
         if measure_shell:
@@ -368,7 +412,7 @@ class ParticleAnalyzer:
             return False
         return True
 
-    def _detect_hough(self, gray, min_area_px):
+    def _detect_hough(self, gray, min_area_px, pw=None):
         """Detect at every size scale the image actually contains.
 
         One scale is chosen for the whole image, and everything downstream is
@@ -395,13 +439,18 @@ class ParticleAnalyzer:
         if not scales:
             return []
         found = []
-        for est in scales:
+        for si, est in enumerate(scales):
+            sub = None
+            if pw is not None:
+                lo, hi = pw
+                sub = (lo + (hi - lo) * si / len(scales),
+                       lo + (hi - lo) * (si + 1) / len(scales))
             part = self._detect_at_scale(gray, blurred, min_area_px, est,
-                                         min_r, w, h)
+                                         min_r, w, h, pw=sub)
             found = self._merge_detections(found, part) if found else part
         return found
 
-    def _detect_at_scale(self, gray, blurred, min_area_px, est, min_r, w, h):
+    def _detect_at_scale(self, gray, blurred, min_area_px, est, min_r, w, h, pw=None):
         gx, gy = self._gradients(gray, est)
 
         min_r2 = max(min_r, int(est * 0.6))
@@ -450,9 +499,18 @@ class ParticleAnalyzer:
         expanded = [self._refine_seed(blurred, cx, cy, r, w, h)
                     for cx, cy, r in expanded]
 
+        # The trace loop and the candidate fits below are the bulk of a scale's
+        # cost, so the progress window is split between them.
+        w_trace = w_cand = None
+        if pw is not None:
+            lo, hi = pw
+            w_trace = (lo, lo + (hi - lo) * 0.55)
+            w_cand = (lo + (hi - lo) * 0.55, lo + (hi - lo) * 0.97)
         traces = []
         strong_scores, outer_scores = [], []
-        for cx, cy, r in expanded:
+        for ti, (cx, cy, r) in enumerate(expanded):
+            if ti % 16 == 0:
+                self._tick(w_trace, ti, len(expanded))
             trace = self._trace_boundary(gx, gy, cx, cy, r, w, h)
             traces.append(trace)
             strong_scores.extend(trace[2][trace[2] > 0])
@@ -469,9 +527,12 @@ class ParticleAnalyzer:
         # kind of object imaged the same way, so a rim resolved on one is a rim
         # on all; choosing per particle is what made neighbouring particles come
         # out a rim-thickness apart in diameter for no physical reason.
-        candidates = [self._boundary_candidates(cx, cy, trace[0], trace, score_thresh,
-                                                r, outer_thresh, blurred)
-                      for (cx, cy, r), trace in zip(expanded, traces)]
+        candidates = []
+        for ci, ((cx, cy, r), trace) in enumerate(zip(expanded, traces)):
+            if ci % 16 == 0:
+                self._tick(w_cand, ci, len(expanded))
+            candidates.append(self._boundary_candidates(
+                cx, cy, trace[0], trace, score_thresh, r, outer_thresh, blurred))
         decidable = [c for c in candidates if c["strong"] is not None and c["outer"] is not None]
         use_outer = bool(decidable) and sum(c["qualifies"] for c in decidable) >= 0.5 * len(decidable)
 
@@ -2058,7 +2119,7 @@ class ParticleAnalyzer:
             p["ring_resized"] = float(target / p["radius_px"] - 1.0)
             self._set_radius(p, target)
 
-    def _snap_to_wall(self, particles, gray):
+    def _snap_to_wall(self, particles, gray, pw=None):
         """Put every boundary on the shell wall, whatever found the particle.
 
         Which of the two fitted transitions a particle's diameter comes from is
@@ -2105,11 +2166,21 @@ class ParticleAnalyzer:
         live = [p for p in particles if not p.get("excluded")]
         if not live:
             return
+        # Carve the caller's window across this method's phases: the two-pass
+        # snap loop is the bulk, then re-centring and levelling.
+        w_snap = w_rec = w_lev = None
+        if pw is not None:
+            lo, hi = pw
+            w_snap = (lo, lo + (hi - lo) * 0.60)
+            w_rec = (lo + (hi - lo) * 0.60, lo + (hi - lo) * 0.72)
+            w_lev = (lo + (hi - lo) * 0.72, hi)
         h, w = gray.shape
         angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
         blurred = cv2.GaussianBlur(gray, (0, 0), self._snap_sigma(gray, live, angles))
         wall_at = self._field_wall_fraction(blurred, live)
-        for p in live:
+        for pi, p in enumerate(live):
+            if pi % 8 == 0:
+                self._tick(w_snap, pi, len(live))
             started = p["radius_px"]
             for _ in range(2):
                 r0 = p["radius_px"]
@@ -2130,8 +2201,8 @@ class ParticleAnalyzer:
                 self._set_radius(p, r)
                 if abs(r / r0 - 1.0) < 0.01:
                     break
-        self._recentre_on_wall(live, blurred, wall_at=wall_at)
-        self._level_across_wall(live, blurred, angles, wall_at=wall_at)
+        self._recentre_on_wall(live, blurred, wall_at=wall_at, pw=w_rec)
+        self._level_across_wall(live, blurred, angles, wall_at=wall_at, pw=w_lev)
         self._flag_irregular(live)
 
     #: How far above the field's own median a wall fit has to sit before the
@@ -2183,7 +2254,7 @@ class ParticleAnalyzer:
                 found.append(r / p["radius_px"])
         return float(np.median(found)) if len(found) >= 8 else None
 
-    def _recentre_on_wall(self, live, blurred, n_angles=180, wall_at=None):
+    def _recentre_on_wall(self, live, blurred, n_angles=180, wall_at=None, pw=None):
         """Re-centre once more, now that the wall's radius is known.
 
         The first re-centring searches for the ring from scratch, over a wide
@@ -2209,7 +2280,9 @@ class ParticleAnalyzer:
         if wall_at is None:
             return
 
-        for p in live:
+        for pi, p in enumerate(live):
+            if pi % 16 == 0:
+                self._tick(pw, pi, len(live))
             r0 = p["radius_px"]
             if r0 < 6:
                 continue
@@ -2264,7 +2337,7 @@ class ParticleAnalyzer:
     #: line. Below this the move is smaller than the noise it is correcting.
     WALL_POSITION_TOLERANCE = 0.10
 
-    def _level_across_wall(self, live, blurred, angles, wall_at=None):
+    def _level_across_wall(self, live, blurred, angles, wall_at=None, pw=None):
         """Put every circle at the same place across its wall as the rest.
 
         Where on the wall the surface lies is decided ray by ray - the middle
@@ -2289,7 +2362,9 @@ class ParticleAnalyzer:
         """
         h, w = blurred.shape
         spans = {}
-        for p in live:
+        for pi, p in enumerate(live):
+            if pi % 16 == 0:
+                self._tick(pw, pi, len(live))
             if p["radius_px"] < 4:
                 continue
             _r, _s, rim, (inner, outer) = self._outer_by_level(
@@ -2364,8 +2439,7 @@ class ParticleAnalyzer:
     #: Below this the move is inside the noise of the fit and not worth making.
     RECENTRE_MIN_MOVE = 0.06
 
-    @staticmethod
-    def _recentre_on_ring(particles, gray, n_angles=180):
+    def _recentre_on_ring(self, particles, gray, n_angles=180, pw=None):
         """Put each circle back on the ring it is supposed to be on.
 
         The boundary is fitted to points traced outward from a seed, and a seed
@@ -2391,7 +2465,9 @@ class ParticleAnalyzer:
         h, w = gray.shape
         angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
         fracs = np.arange(0.78, 1.26, 0.02)
-        for p in live:
+        for pi, p in enumerate(live):
+            if pi % 16 == 0:
+                self._tick(pw, pi, len(live))
             cx, cy, r = p["center_x"], p["center_y"], p["radius_px"]
             pts = []
             for a in angles:

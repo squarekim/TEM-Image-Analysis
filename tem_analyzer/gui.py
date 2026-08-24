@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
     QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox, QSplitter,
-    QMessageBox, QHeaderView, QComboBox, QCheckBox,
+    QMessageBox, QHeaderView, QComboBox, QCheckBox, QProgressBar,
 )
 from PyQt5.QtCore import Qt, QPoint, QRectF
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
@@ -378,6 +378,13 @@ class MainWindow(QMainWindow):
         self.btn_analyze.clicked.connect(self._run_analysis)
         btn_layout.addWidget(self.btn_analyze)
 
+        # A dense field takes tens of seconds; without this the window looks
+        # frozen. It is hidden until an analysis starts and again when it ends.
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setTextVisible(True)
+        self.progress.setVisible(False)
+
         self.btn_export = QPushButton("Excel 내보내기")
         self.btn_export.setMinimumHeight(36)
         self.btn_export.setEnabled(False)
@@ -390,6 +397,7 @@ class MainWindow(QMainWindow):
         self.btn_save_image.clicked.connect(self._save_result_image)
         btn_layout.addWidget(self.btn_save_image)
         left_layout.addLayout(btn_layout)
+        left_layout.addWidget(self.progress)
 
         self.image_label = ImageLabel()
         self.image_label.click_callback = self._on_image_click
@@ -730,11 +738,22 @@ class MainWindow(QMainWindow):
             max_area = None
 
         # Analysis runs on the UI thread and takes seconds on full-resolution
-        # TEM images, so make the wait visible instead of looking frozen.
+        # TEM images, so make the wait visible instead of looking frozen. The
+        # analyzer reports progress through a callback; because we are on the UI
+        # thread, processEvents lets the bar actually repaint between stages.
         self.statusBar().showMessage("분석 중...")
         self.btn_analyze.setEnabled(False)
+        self.progress.setValue(0)
+        self.progress.setFormat("분석 준비 중… %p%")
+        self.progress.setVisible(True)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
+
+        def _on_progress(frac, label):
+            self.progress.setValue(int(frac * 100))
+            self.progress.setFormat(f"{label}… %p%")
+            QApplication.processEvents()
+
         try:
             analyzer = ParticleAnalyzer(
                 nm_per_px=self.nm_per_px,
@@ -750,10 +769,12 @@ class MainWindow(QMainWindow):
                 hollow=self.chk_hollow.isChecked(),
                     detect_cores=self.chk_core.isChecked(),
                 measure_shell=self.chk_shell.isChecked(),
+                progress=_on_progress,
             )
         finally:
             QApplication.restoreOverrideCursor()
             self.btn_analyze.setEnabled(True)
+            self.progress.setVisible(False)
 
         self._draw_results()
         stats = ParticleAnalyzer.compute_statistics(self.particles)
