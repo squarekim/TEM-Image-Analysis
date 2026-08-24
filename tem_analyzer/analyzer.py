@@ -279,6 +279,7 @@ class ParticleAnalyzer:
 
         self._reject_implausible_interiors(particles, analysis_region)
         self._recentre_on_ring(particles, analysis_region)
+        self._resize_by_ring(particles, analysis_region)
         self._snap_to_wall(particles, analysis_region)
         if self.sphere_edge:
             self._refine_by_sphere_edge(particles, analysis_region)
@@ -1778,6 +1779,122 @@ class ParticleAnalyzer:
     #: thickness. See `_snap_sigma` for why it is tied to that and not to the
     #: radius or to a fixed number of pixels.
     SNAP_SMOOTH_FRAC = 0.35
+
+    #: How far a particle's wall may sit from where the rest of the field puts
+    #: its wall, as a share of the radius, before the circle is resized to
+    #: match. Within one image the wall is the same fraction of the radius on
+    #: every particle, so a circle that disagrees by more than this is not a
+    #: circle round a differently-built particle - it is the wrong circle.
+    RING_TOLERANCE = 0.07
+
+    #: The vote for a coherent ring has to reach this share of the rays. A
+    #: phantom in the gap between particles scores 0.35 against 2.1-6.3 for the
+    #: particles around it, because the dark arcs it borrows are pieces of
+    #: several neighbours at several radii and they do not stack up.
+    RING_MIN_VOTE = 1.2
+
+    def _ring_radius(self, blurred, cx, cy, r0, n_angles=96,
+                     lo=0.55, hi=1.40, tol=0.03):
+        """The radius at which a dark ring closes round this centre.
+
+        A ray cannot tell this particle's wall from a neighbour's; both are
+        dark bands crossing it. What tells them apart is that only one of them
+        is at the same radius in every direction. Collecting every dark band on
+        every ray and asking which radius they agree on finds the particle's
+        own wall even when it is not the deepest band on most rays - which is
+        the case for a circle that was fitted a third too large, where two
+        thirds of the rays find a neighbour's wall first and the median lands
+        in the gap between the two.
+
+        Returns the radius and the vote it won, in rays. The vote is itself
+        worth having: a phantom sitting between particles borrows arcs from
+        several neighbours at several radii, and they do not stack.
+        """
+        h, w = blurred.shape
+        radii = np.arange(r0 * lo, r0 * hi, 0.5)
+        if len(radii) < 8:
+            return None, 0.0
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        fx = cx + np.outer(np.cos(angles), radii)
+        fy = cy + np.outer(np.sin(angles), radii)
+        inside = (fx >= 0) & (fx < w) & (fy >= 0) & (fy < h)
+        prof = blurred[np.clip(fy, 0, h - 1).astype(int),
+                       np.clip(fx, 0, w - 1).astype(int)].astype(np.float32)
+
+        span = float(np.percentile(prof, 90) - np.percentile(prof, 10))
+        floor = max(6.0, 0.25 * span)
+        usable = inside.mean(axis=1) >= 0.9
+        if usable.sum() < n_angles * 0.4:
+            return None, 0.0
+        prof = prof[usable]
+
+        dip = np.zeros_like(prof, bool)
+        dip[:, 1:-1] = (prof[:, 1:-1] <= prof[:, :-2]) & (prof[:, 1:-1] <= prof[:, 2:])
+        left = np.maximum.accumulate(prof, axis=1)
+        right = np.maximum.accumulate(prof[:, ::-1], axis=1)[:, ::-1]
+        deep = np.minimum(left - prof, right - prof) >= floor
+        hits = np.count_nonzero(dip & deep, axis=0).astype(np.float64)
+        if not hits.any():
+            return None, 0.0
+
+        # Smear each vote over the tolerance so that rays agreeing to within a
+        # few percent reinforce one another instead of splitting the peak.
+        width = max(1.0, tol * r0 / 0.5)
+        k = np.exp(-0.5 * (np.arange(-int(3 * width), int(3 * width) + 1) / width) ** 2)
+        votes = np.convolve(hits, k, mode="same")
+        top = float(votes.max())
+        # Among radii that essentially tie, the innermost. A neighbour's wall
+        # can lie outside this particle's, never inside it, so when two radii
+        # are equally coherent the smaller one is the one that belongs to this
+        # particle.
+        best = int(np.flatnonzero(votes >= 0.85 * top)[0])
+        return float(radii[best]), top / max(1, prof.shape[0])
+
+    def _resize_by_ring(self, particles, gray):
+        """Resize circles whose wall is not where the field puts its walls.
+
+        Within one image every particle is the same object imaged the same way,
+        so the wall sits at the same fraction of the radius on all of them -
+        measured on real micrographs, 0.86 to 0.91 with a spread of a few
+        percent. A circle that was fitted round a particle *and* the bright
+        halo outside it has its wall at 0.69 or 0.72 of its radius instead, and
+        that is the signature: not that the particle is unusual, but that the
+        circle is. Rescaling it so its wall sits where everyone else's does
+        recovers the particle without any assumption about brightness levels.
+
+        The per-ray placement afterwards (`_snap_to_wall`) still decides exactly
+        where on the wall the surface is; this only gets the circle onto the
+        right wall first.
+        """
+        live = [p for p in particles if not p.get("excluded")]
+        if len(live) < 8:
+            return
+        angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
+        blurred = cv2.GaussianBlur(gray, (0, 0), self._snap_sigma(gray, live, angles))
+        found = []
+        for p in live:
+            r, vote = self._ring_radius(blurred, p["center_x"], p["center_y"],
+                                        p["radius_px"])
+            p["ring_vote"] = float(vote)
+            found.append(r)
+        ratios = [r / p["radius_px"] for p, r, in zip(live, found)
+                  if r is not None and p["ring_vote"] >= self.RING_MIN_VOTE]
+        if len(ratios) < 8:
+            return
+        # The field's own answer, not a constant: a thicker shell or a
+        # different focus moves it, and every particle in the image moves with
+        # it.
+        typical = float(np.median(ratios))
+        for p, r in zip(live, found):
+            if r is None or p["ring_vote"] < self.RING_MIN_VOTE:
+                continue
+            target = r / typical
+            if abs(target / p["radius_px"] - 1.0) <= self.RING_TOLERANCE:
+                continue
+            if not (0.5 <= target / p["radius_px"] <= 1.6):
+                continue
+            p["ring_resized"] = float(target / p["radius_px"] - 1.0)
+            self._set_radius(p, target)
 
     def _snap_to_wall(self, particles, gray):
         """Put every boundary on the shell wall, whatever found the particle.

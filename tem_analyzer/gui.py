@@ -849,9 +849,16 @@ class MainWindow(QMainWindow):
                 # it to whole source pixels before the upscale turns every
                 # half-pixel wobble into a `scale`-pixel staircase.
                 scaled_cnt = np.round(p["contour"].astype(np.float64) * scale).astype(np.int32)
+                # A particle the frame cuts is drawn as the arc that was
+                # actually seen, with the rest a hairline, whatever the option
+                # says. Its diameter comes from that arc and the closing
+                # stretch is an extrapolation; drawn at full weight it reads as
+                # a measured boundary lying over blank frame, and a reader
+                # rightly marks it as an error.
                 self._draw_boundary(display, scaled_cnt, (cx, cy), color, thickness,
                                     p.get("contour_measured"),
-                                    self.chk_mark_inferred.isChecked())
+                                    self.chk_mark_inferred.isChecked()
+                                    or bool(p.get("partial")))
             else:
                 cv2.circle(display, (cx, cy), r, color, thickness)
             if excluded:
