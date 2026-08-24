@@ -2478,28 +2478,38 @@ class ParticleAnalyzer:
         blurred = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.5)
         h, w = gray.shape
         angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
         fracs = np.arange(0.78, 1.26, 0.02)
         for pi, p in enumerate(live):
             if pi % 16 == 0:
                 self._tick(pw, pi, len(live))
             cx, cy, r = p["center_x"], p["center_y"], p["radius_px"]
-            pts = []
-            for a in angles:
-                xs = (cx + r * fracs * np.cos(a)).astype(int)
-                ys = (cy + r * fracs * np.sin(a)).astype(int)
-                if not ((xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)).all():
-                    continue
-                prof = blurred[ys, xs]
-                k = int(np.argmin(prof))
-                if k == 0 or k == len(prof) - 1:
-                    continue
-                if min(prof[:k].max() - prof[k], prof[k:].max() - prof[k]) < 8:
-                    continue
-                rr = r * fracs[k]
-                pts.append((cx + rr * np.cos(a), cy + rr * np.sin(a)))
-            if len(pts) < n_angles * 0.22:
+            # The per-angle darkest-point search, over all angles at once. The
+            # arithmetic is kept in the same order the scalar loop used -
+            # (r*fracs) formed first, then multiplied by cos/sin per angle - so
+            # the .astype(int) truncation, and with it the pixel each ray
+            # samples, is bit-for-bit what the loop produced.
+            rf = r * fracs
+            xs = (cx + rf[None, :] * cos_a[:, None]).astype(int)
+            ys = (cy + rf[None, :] * sin_a[:, None]).astype(int)
+            allin = ((xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)).all(axis=1)
+            prof = blurred[np.clip(ys, 0, h - 1), np.clip(xs, 0, w - 1)]
+            k = np.argmin(prof, axis=1)
+            valley = prof.min(axis=1)
+            fwd = np.maximum.accumulate(prof, axis=1)
+            rev = np.maximum.accumulate(prof[:, ::-1], axis=1)[:, ::-1]
+            rows = np.arange(len(angles))
+            # prof[:k].max() is the running max up to k-1; prof[k:].max() the
+            # running max from k. Guard k-1 for the k==0 rays, which are
+            # dropped anyway.
+            left_max = fwd[rows, np.maximum(k - 1, 0)]
+            right_max = rev[rows, k]
+            depth = np.minimum(left_max - valley, right_max - valley)
+            good = allin & (k != 0) & (k != prof.shape[1] - 1) & (depth >= 8)
+            if good.sum() < n_angles * 0.22:
                 continue
-            P = np.array(pts)
+            rr = r * fracs[k[good]]
+            P = np.column_stack([cx + rr * cos_a[good], cy + rr * sin_a[good]])
             ux = uy = rad = None
             resid = None
             for _ in range(3):
