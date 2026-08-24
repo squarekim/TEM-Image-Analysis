@@ -277,10 +277,17 @@ class ParticleAnalyzer:
                 kept.append(p)
             particles = kept
 
-        self._reject_implausible_interiors(particles, analysis_region)
+        # Geometry first, judgement second. Every rule below asks what a circle
+        # encloses or what lies on it, and the answer is worthless while the
+        # circle is in the wrong place: a real particle whose circle was fitted
+        # a third too large has no ring on its circumference either, and gets
+        # thrown out with the phantoms. Correcting the circle first cost
+        # nothing - the corrections only move circles, they do not create them -
+        # and recovered particles a reader had marked as missed.
         self._recentre_on_ring(particles, analysis_region)
         self._resize_by_ring(particles, analysis_region)
         self._snap_to_wall(particles, analysis_region)
+        self._reject_implausible_interiors(particles, analysis_region)
         if self.sphere_edge:
             self._refine_by_sphere_edge(particles, analysis_region)
         self._reject_clipped(particles, analysis_region.shape)
@@ -289,6 +296,20 @@ class ParticleAnalyzer:
         self._reject_unoutlined(particles,
                                 cv2.GaussianBlur(analysis_region, (0, 0), 1.5))
         self._reject_annotated(particles, analysis_region)
+
+        # Last, and only where nothing is left: a solid dark particle has no
+        # bright interior for the main path to enclose, so it is not that its
+        # candidate was rejected - there was never a candidate. Asking earlier
+        # does not work either, because at that point the field is still full
+        # of candidates that will be rejected, and one of them is sitting on
+        # the dark particle; it looks covered right up until it is not.
+        extra = self._detect_dark_bodies(analysis_region, particles)
+        if extra:
+            particles = particles + extra
+            self._resize_by_ring(particles, analysis_region)
+            self._snap_to_wall(particles, analysis_region)
+            self._reject_clipped(particles, analysis_region.shape)
+            self._reject_annotated(particles, analysis_region)
         self._flag_defects(particles, analysis_region)
 
         if measure_shell:
@@ -1226,6 +1247,95 @@ class ParticleAnalyzer:
                 else:
                     p["overlap"] = q["overlap"] = True
 
+    #: A dark body has to be this round, and fill this much of the circle
+    #: drawn round it, to be a particle rather than the junction where three
+    #: shell walls meet. Measured on real fields: particles a reader marked as
+    #: missed score 0.80-0.93 and 0.66-0.96, wall junctions 0.25-0.79 and
+    #: 0.28-0.68, and no junction clears both.
+    DARK_BODY_ROUNDNESS = 0.75
+    DARK_BODY_FILL = 0.65
+
+    #: Share of the detections that may be solid dark bodies before this path
+    #: is switched off as meaningless for the image. Real fields of hollow
+    #: particles run at 2-5%; a field of solid discs runs at nearly 100%.
+    DARK_BODY_MAX_SHARE = 0.25
+
+    def _detect_dark_bodies(self, gray, found):
+        """Particles that are solid dark right through, which nothing else finds.
+
+        The main path for a packed field finds a *bright* interior sealed
+        inside its own dark shell. A particle whose template was never
+        dissolved out, or whose shell collapsed inward, has no bright interior
+        at all - it is a dark disc - so it never becomes a candidate, and no
+        later rule can recover what was never proposed. These were the
+        particles left uncircled on a field a reader went through by hand.
+
+        In the shell mask such a particle is a solid blob hanging off the wall
+        network, and the network itself is thin. Opening the mask with a disc
+        half a particle wide erases the walls and leaves the blobs. What it
+        also leaves is the junction where three walls meet, which is thick for
+        the same reason; that one is a concave triangle, so roundness and how
+        much of its own circle it fills separate them with nothing in between.
+
+        Only the position and a rough size come from here. Both are then
+        corrected like any other detection - the ring search finds the wall and
+        the per-ray rule places the surface on it - so a yolk-shell particle
+        whose dark core is smaller than the particle still ends up measured at
+        its shell.
+        """
+        live = [p for p in found if not p.get("excluded")]
+        if len(live) < 8:
+            return []
+        r_med = float(np.median([p["radius_px"] for p in live]))
+        if r_med < 6:
+            return []
+        blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
+        _, dark = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        k = int(r_med * 0.55) | 1
+        solid = cv2.morphologyEx(
+            dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(solid, 8)
+
+        out = []
+        for j in range(1, n):
+            area = float(stats[j, cv2.CC_STAT_AREA])
+            if not (np.pi * (r_med * 0.5) ** 2 <= area <= np.pi * (r_med * 1.8) ** 2):
+                continue
+            cnts, _ = cv2.findContours((labels == j).astype(np.uint8),
+                                       cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                continue
+            cnt = max(cnts, key=cv2.contourArea)
+            perim = cv2.arcLength(cnt, True)
+            if perim <= 0:
+                continue
+            (cx, cy), r = cv2.minEnclosingCircle(cnt)
+            if r <= 0:
+                continue
+            roundness = 4 * np.pi * area / (perim * perim)
+            fill = area / (np.pi * r * r)
+            if roundness < self.DARK_BODY_ROUNDNESS or fill < self.DARK_BODY_FILL:
+                continue
+            out.append((cx, cy, r))
+
+        # This path is for the exceptions in a field of hollow particles. Where
+        # the particles are solid dark discs to begin with - which is what the
+        # `hard` fixture is - every one of them is a dark body, the main path
+        # already has them all, and proposing them again only gives the overlap
+        # rules a second copy to choose between. One real particle was lost and
+        # one spurious circle gained that way before this gate existed.
+        if len(out) > self.DARK_BODY_MAX_SHARE * len(live):
+            return []
+        out = [self._measure_circle(cx, cy, r, np.pi * r * r)
+               for cx, cy, r in out
+               if not any(np.hypot(p["center_x"] - cx, p["center_y"] - cy)
+                          < p["radius_px"] * 0.6 for p in live)]
+        for p in out:
+            p["excluded"] = False
+            p["approx"] = False
+            p["dark_body"] = True
+        return out
+
     def _detect_enclosed(self, gray, min_area_px, n_angles=180):
         """Particles as bright interiors enclosed by their own dark shell.
 
@@ -1738,6 +1848,7 @@ class ParticleAnalyzer:
         angles = np.linspace(0, 2 * np.pi, 64, endpoint=False)
         cos_a, sin_a = np.cos(angles), np.sin(angles)
         steps = np.arange(0.80, 1.25, 0.03)
+        readings = []
         for p in particles:
             p.setdefault("defect", False)
             if p.get("excluded"):
@@ -1757,11 +1868,34 @@ class ParticleAnalyzer:
             if inside.size < 25:
                 continue
             level = float(np.percentile(inside, 80))
-            # Without a wall to measure against there is no scale to judge a
-            # lump by, and the ratio would be noise divided by noise.
-            if level - wall < 6:
+            readings.append((p, level, wall))
+
+        if not readings:
+            return
+        # What an intact particle's inside reads, taken from the field itself
+        # so that exposure and film thickness cancel.
+        typical = float(np.median([lv for _, lv, _ in readings]))
+        floor = float(np.median([wl for _, _, wl in readings]))
+        for p, level, wall in readings:
+            rr = p["radius_px"] * 0.65
+            cx, cy = p["center_x"], p["center_y"]
+            x0, x1 = max(0, int(cx - rr)), min(w, int(cx + rr) + 1)
+            y0, y1 = max(0, int(cy - rr)), min(h, int(cy + rr) + 1)
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            inside = blurred[y0:y1, x0:x1][np.hypot(xx - cx, yy - cy) <= rr]
+            if level - wall >= 6:
+                share = float(np.mean(inside < level - 0.40 * (level - wall)))
+            elif typical - floor >= 6:
+                # A particle packed solid right through has no wall to measure
+                # against - its inside and its edge read the same - so the ratio
+                # above is noise over noise. That flatness is itself the answer,
+                # as long as what it is flat *at* is the dark end: judged
+                # against what an intact particle in the same field reads, the
+                # whole disc is then below the halfway mark and the share comes
+                # out at 1.
+                share = float(np.mean(inside < typical - 0.40 * (typical - floor)))
+            else:
                 continue
-            share = float(np.mean(inside < level - 0.40 * (level - wall)))
             p["defect_share"] = share
             p["defect"] = share >= self.DEFECT_DARK_SHARE
 
