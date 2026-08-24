@@ -828,38 +828,66 @@ class ParticleAnalyzer:
         rim_votes = []
         edges = []
 
-        for i in range(len(angles)):
-            if not np.isfinite(outside[i]) or inside[i].sum() < len(radii) * 0.5:
-                continue
-            seg = prof[i, band_idx]
-            # The rim may be darker or brighter than its surroundings; take
-            # whichever extreme departs further from the outside level.
-            lo, hi = seg.min(), seg.max()
-            # An out-of-focus edge throws a bright Fresnel fringe just outside
-            # the particle, and on these micrographs the gaps between particles
-            # read *darker* than the interiors, so the fringe is the bigger
-            # departure from the surrounding level and this picks it as the rim
-            # - putting the boundary a fringe-width outside the particle. A
-            # caller that knows it is looking for a shell wall says so, because
-            # a wall is dark by construction.
-            dark = (outside[i] - lo) >= (hi - outside[i])
-            if wall_only and np.isfinite(interior[i]):
-                # A shell wall is a trough: darker than the particle's inside
-                # *and* darker than what is beyond it. Asking only which
-                # extreme departs further from the level outside gets this
-                # wrong in both directions - a bright Fresnel fringe outruns
-                # the wall and gets picked as the boundary, while on bright
-                # particles against a dark ground the background itself is the
-                # darkest thing on the ray and is not a wall at all. Requiring
-                # a real depth on both sides separates them: the yolk-shell
-                # wall clears it four times over, the fringe and the background
-                # do not clear it at all.
-                dark = min(outside[i] - lo, interior[i] - lo) >= 0.25 * (hi - lo)
-            k = band_idx[int(np.argmin(seg) if dark else np.argmax(seg))]
-            extreme = prof[i, k]
-            contrast = abs(outside[i] - extreme)
-            if contrast < 4:
-                continue
+        # Hoisted out of the per-angle loop: defining it inside built a fresh
+        # closure on every one of the 180 angles, hundreds of thousands per
+        # dense field. `prof` and `radii` do not change per angle, so this is
+        # the same function; the per-angle state it used to capture (i, k,
+        # extreme, dark) is passed in instead.
+        def half_height(i, k, extreme, dark, level, forward):
+            target = extreme + 0.5 * (level - extreme)
+            walk = prof[i, k:] if forward else prof[i, :k + 1][::-1]
+            crossed = (walk >= target) if dark else (walk <= target)
+            j = int(np.argmax(crossed))
+            if not crossed[j]:
+                return None
+            step = k + j if forward else k - j
+            if step == k:
+                return radii[k]
+            prev = step - 1 if forward else step + 1
+            a, b = prof[i, prev], prof[i, step]
+            t = 0.0 if b == a else (target - a) / (b - a)
+            return radii[prev] + t * (radii[step] - radii[prev])
+
+        # The per-angle preamble - which extreme is the rim, where it is, and
+        # how strong - is the same arithmetic on every angle, so it is done on
+        # all of them at once. The old loop called .min()/.max()/argmin/argmax
+        # a handful of times per angle, two million tiny reductions on a dense
+        # field; this is a fixed few. The scalars each angle used to compute
+        # are pulled from these arrays unchanged, so the result is identical.
+        seg2d = prof[:, band_idx]
+        lo_arr = seg2d.min(axis=1)
+        hi_arr = seg2d.max(axis=1)
+        # The rim may be darker or brighter than its surroundings; take
+        # whichever extreme departs further from the outside level. An
+        # out-of-focus edge throws a bright Fresnel fringe just outside the
+        # particle, and on these micrographs the gaps between particles read
+        # *darker* than the interiors, so the fringe is the bigger departure
+        # and this picks it as the rim, putting the boundary a fringe-width
+        # out. A caller looking for a shell wall says wall_only, because a wall
+        # is dark by construction - a trough darker than the particle's inside
+        # *and* darker than what is beyond it - and requiring depth on both
+        # sides separates the wall from the fringe and from a dark background.
+        with np.errstate(invalid="ignore"):
+            dark_arr = (outside - lo_arr) >= (hi_arr - outside)
+            if wall_only:
+                fin_int = np.isfinite(interior)
+                dark_wall = (np.minimum(outside - lo_arr, interior - lo_arr)
+                             >= 0.25 * (hi_arr - lo_arr))
+                dark_arr = np.where(fin_int, dark_wall, dark_arr)
+            k_arr = np.where(dark_arr, band_idx[np.argmin(seg2d, axis=1)],
+                             band_idx[np.argmax(seg2d, axis=1)])
+            extreme_arr = prof[np.arange(len(angles)), k_arr]
+            contrast_arr = np.abs(outside - extreme_arr)
+            gate = (np.isfinite(outside)
+                    & (inside.sum(axis=1) >= len(radii) * 0.5)
+                    & (contrast_arr >= 4))
+
+        for i in np.flatnonzero(gate):
+            i = int(i)
+            k = int(k_arr[i])
+            dark = bool(dark_arr[i])
+            extreme = extreme_arr[i]
+            contrast = contrast_arr[i]
             # A rim is a band that stands out from the particle's own interior,
             # not merely a step from interior to background. Asking instead
             # whether a dark dip sits between the steepest point and this one
@@ -882,22 +910,8 @@ class ParticleAnalyzer:
             # on a real particle whose rim is 9% of the radius wide. Measuring
             # the half-height on both flanks gives the rim's full extent, and
             # the setting then slides between them - 0% at the inner flank,
-            # 50% on the rim, 100% at the outer flank.
-            def half_height(level, forward):
-                target = extreme + 0.5 * (level - extreme)
-                walk = prof[i, k:] if forward else prof[i, :k + 1][::-1]
-                crossed = (walk >= target) if dark else (walk <= target)
-                j = int(np.argmax(crossed))
-                if not crossed[j]:
-                    return None
-                step = k + j if forward else k - j
-                if step == k:
-                    return radii[k]
-                prev = step - 1 if forward else step + 1
-                a, b = prof[i, prev], prof[i, step]
-                t = 0.0 if b == a else (target - a) / (b - a)
-                return radii[prev] + t * (radii[step] - radii[prev])
-
+            # 50% on the rim, 100% at the outer flank. (half_height is hoisted
+            # above this loop; the per-angle state it needs is passed in.)
             if wall_only:
                 # The wall's outer flank rises to the shoulder immediately
                 # outside it, not to the level far away, and half-height has to
@@ -931,10 +945,10 @@ class ParticleAnalyzer:
                 fall = shoulder - float(out_seg[stop:].min())
                 level = (shoulder if min(rise, fall) >= 0.25 * contrast
                          else outside[i])
-                r_outer_edge = half_height(level, True)
+                r_outer_edge = half_height(i, k, extreme, dark, level, True)
             else:
-                r_outer_edge = half_height(outside[i], True)
-            r_inner_edge = (half_height(interior[i], False)
+                r_outer_edge = half_height(i, k, extreme, dark, outside[i], True)
+            r_inner_edge = (half_height(i, k, extreme, dark, interior[i], False)
                             if np.isfinite(interior[i]) else None)
             if r_outer_edge is None:
                 continue
