@@ -9,8 +9,8 @@ Two fixtures are at their floor rather than waiting to be improved, and the
 evidence is recorded here so the next person does not spend the afternoon
 finding it again:
 
-  hard    1.9% over 15 of its 18 particles, and nearly all of it is the three
-          or four of radius 6-9 measured about 8% large. They are below the
+  hard    3.8% over 15 of its 18 particles, and nearly all of it is the three
+          or four of radius 6-9 measured about 15% large. They are below the
           seed search, and they cannot be brought into it: the octave scan
           needs three circles to call a band, and Hough finds one of the four
           at param2=30 and still only one at param2=15, by which point four
@@ -23,6 +23,14 @@ finding it again:
           throwing out for having no ring on a circumference that was in the
           wrong place - and it costs one particle at the detection limit here,
           while improving what the rest of the fixture measures.
+          It reads 1.9% if the wall search is left unconfined. Confining it to
+          the band the field agrees on is what stops a small particle wedged
+          among larger ones from walking out onto its neighbours' walls - one
+          real circle grew from 40 px to 55 that way - and this fixture is the
+          one place it costs something, because its rims are a fixed two pixels
+          wide whatever the particle's size, so there is no single fraction of
+          the radius that describes them. A real shell scales with its
+          particle.
   hollow  2.0%, of which the bias is -1.1% (-0.34 px) and the rest is scatter
           between particles, 4.1%. That is measurement noise on individual
           boundaries, not a systematic error with a cause to remove.

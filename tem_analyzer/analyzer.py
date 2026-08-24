@@ -706,7 +706,7 @@ class ParticleAnalyzer:
         return out
 
     def _outer_by_level(self, blurred, cx, cy, r0, angles, w, h, frac=None,
-                        wall_only=False):
+                        wall_only=False, wall_at=None):
         """Radius where the rim's darkening has faded back to the surroundings.
 
         A gradient crest is only a boundary when the edge is sharp. Where the
@@ -728,7 +728,17 @@ class ParticleAnalyzer:
         inside = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
         prof = blurred[np.clip(ys, 0, h - 1), np.clip(xs, 0, w - 1)].astype(np.float32)
 
-        band = (radii >= 0.65 * r0) & (radii <= 1.25 * r0)
+        # Where to look for the wall. Left open the search spans two thirds of
+        # a radius either side, which is fine when the circle is roughly right
+        # and wrong when it is not: a small particle wedged among larger ones
+        # has its neighbours' walls inside that span, and the median then walks
+        # outward onto them - one grew from 40 px to 55 that way, swallowing
+        # the gap and part of a neighbour. Once the field has agreed where its
+        # walls sit, saying so confines the search to a band around that.
+        if wall_at:
+            band = (radii >= (wall_at - 0.13) * r0) & (radii <= (wall_at + 0.30) * r0)
+        else:
+            band = (radii >= 0.65 * r0) & (radii <= 1.25 * r0)
         far = radii >= 1.35 * r0
         core = (radii >= 0.5 * r0) & (radii <= 0.62 * r0)
         if not band.any() or not far.any():
@@ -1909,10 +1919,16 @@ class ParticleAnalyzer:
     #: to be a radius rather than a local reading.
     SNAP_MIN_RAYS = 0.60
 
-    #: Largest move allowed, as a share of the radius. A wall further away than
-    #: this is not the particle's own - it is the neighbour behind the gap - and
-    #: snapping to it would swap one particle for another.
-    SNAP_MAX_MOVE = 0.30
+    #: Largest move allowed, as a share of the radius, in one pass and in
+    #: total. A wall further away than this is not the particle's own - it is
+    #: the neighbour behind the gap - and snapping to it would swap one
+    #: particle for another. The total matters as much as the step: a small
+    #: particle wedged among larger ones has its neighbours' walls inside its
+    #: own search band, and two unbounded passes walked one out from 40 px to
+    #: 55, swallowing the gap and part of a neighbour. By this point the ring
+    #: search has already fixed the gross errors, so the snap only has to
+    #: fine-tune and does not need the room.
+    SNAP_MAX_MOVE = 0.15
 
     #: Smoothing before the wall is read, as a share of the wall's own
     #: thickness. See `_snap_sigma` for why it is tied to that and not to the
@@ -1931,6 +1947,9 @@ class ParticleAnalyzer:
     #: particles around it, because the dark arcs it borrows are pieces of
     #: several neighbours at several radii and they do not stack up.
     RING_MIN_VOTE = 1.2
+
+    #: Largest resize the ring search may ask for, as a share of the radius.
+    RING_MAX_RESIZE = 0.25
 
     def _ring_radius(self, blurred, cx, cy, r0, n_angles=96,
                      lo=0.55, hi=1.40, tol=0.03):
@@ -2030,7 +2049,11 @@ class ParticleAnalyzer:
             target = r / typical
             if abs(target / p["radius_px"] - 1.0) <= self.RING_TOLERANCE:
                 continue
-            if not (0.5 <= target / p["radius_px"] <= 1.6):
+            # The same trap as the snap: a small particle among larger ones has
+            # its neighbours' walls inside its own search band, and without a
+            # ceiling the ring vote can settle on one of them.
+            if not (1.0 - self.RING_MAX_RESIZE <= target / p["radius_px"]
+                    <= 1.0 + self.RING_MAX_RESIZE):
                 continue
             p["ring_resized"] = float(target / p["radius_px"] - 1.0)
             self._set_radius(p, target)
@@ -2085,26 +2108,30 @@ class ParticleAnalyzer:
         h, w = gray.shape
         angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
         blurred = cv2.GaussianBlur(gray, (0, 0), self._snap_sigma(gray, live, angles))
+        wall_at = self._field_wall_fraction(blurred, live)
         for p in live:
+            started = p["radius_px"]
             for _ in range(2):
                 r0 = p["radius_px"]
                 if r0 < 4:
                     break
                 r_ang, _s, rim_frac, _span = self._outer_by_level(
                     blurred, p["center_x"], p["center_y"], r0, angles, w, h,
-                    frac=self.edge_level, wall_only=True)
+                    frac=self.edge_level, wall_only=True, wall_at=wall_at)
                 seen = np.isfinite(r_ang)
                 if seen.mean() < self.SNAP_MIN_RAYS or rim_frac < self.RIM_MIN_RAYS:
                     break
                 r = float(np.median(r_ang[seen]))
                 if not (1.0 - self.SNAP_MAX_MOVE <= r / r0 <= 1.0 + self.SNAP_MAX_MOVE):
                     break
+                r = float(np.clip(r, started * (1.0 - self.SNAP_MAX_MOVE),
+                                  started * (1.0 + self.SNAP_MAX_MOVE)))
                 p["wall_offset"] = float(r / r0 - 1.0)
                 self._set_radius(p, r)
                 if abs(r / r0 - 1.0) < 0.01:
                     break
-        self._recentre_on_wall(live, blurred)
-        self._level_across_wall(live, blurred, angles)
+        self._recentre_on_wall(live, blurred, wall_at=wall_at)
+        self._level_across_wall(live, blurred, angles, wall_at=wall_at)
         self._flag_irregular(live)
 
     #: How far above the field's own median a wall fit has to sit before the
@@ -2146,7 +2173,17 @@ class ParticleAnalyzer:
     #: centre it implies is not worth trusting.
     WALL_CENTRE_MAX_RMS = 0.05
 
-    def _recentre_on_wall(self, live, blurred, n_angles=180):
+    def _field_wall_fraction(self, blurred, live):
+        """Where the field puts its walls, as a share of the radius."""
+        found = []
+        for p in live:
+            r, vote = self._ring_radius(blurred, p["center_x"], p["center_y"],
+                                        p["radius_px"])
+            if r and vote >= self.RING_MIN_VOTE:
+                found.append(r / p["radius_px"])
+        return float(np.median(found)) if len(found) >= 8 else None
+
+    def _recentre_on_wall(self, live, blurred, n_angles=180, wall_at=None):
         """Re-centre once more, now that the wall's radius is known.
 
         The first re-centring searches for the ring from scratch, over a wide
@@ -2167,16 +2204,10 @@ class ParticleAnalyzer:
         h, w = blurred.shape
         angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
         cos_a, sin_a = np.cos(angles), np.sin(angles)
-        found = []
-        for p in live:
-            r, vote = self._ring_radius(blurred, p["center_x"], p["center_y"],
-                                        p["radius_px"])
-            found.append(r / p["radius_px"]
-                         if r and vote >= self.RING_MIN_VOTE else None)
-        typical = [f for f in found if f]
-        if len(typical) < 8:
+        if wall_at is None:
+            wall_at = self._field_wall_fraction(blurred, live)
+        if wall_at is None:
             return
-        wall_at = float(np.median(typical))
 
         for p in live:
             r0 = p["radius_px"]
@@ -2233,7 +2264,7 @@ class ParticleAnalyzer:
     #: line. Below this the move is smaller than the noise it is correcting.
     WALL_POSITION_TOLERANCE = 0.10
 
-    def _level_across_wall(self, live, blurred, angles):
+    def _level_across_wall(self, live, blurred, angles, wall_at=None):
         """Put every circle at the same place across its wall as the rest.
 
         Where on the wall the surface lies is decided ray by ray - the middle
@@ -2263,7 +2294,7 @@ class ParticleAnalyzer:
                 continue
             _r, _s, rim, (inner, outer) = self._outer_by_level(
                 blurred, p["center_x"], p["center_y"], p["radius_px"], angles,
-                w, h, frac=self.edge_level, wall_only=True)
+                w, h, frac=self.edge_level, wall_only=True, wall_at=wall_at)
             if rim < self.RIM_MIN_RAYS or not np.isfinite(inner) or outer <= inner:
                 continue
             spans[id(p)] = (inner, outer)
@@ -2280,7 +2311,7 @@ class ParticleAnalyzer:
                 continue
             inner, outer = spans[k]
             r = inner + common * (outer - inner)
-            if not (0.8 <= r / p["radius_px"] <= 1.25):
+            if not (0.88 <= r / p["radius_px"] <= 1.14):
                 continue
             p["wall_place"] = float(places[k])
             self._set_radius(p, r)
