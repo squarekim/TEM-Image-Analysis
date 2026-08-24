@@ -71,8 +71,46 @@ def scale_bar_px(gray):
     return best or None
 
 
+def packing_ratio(particles):
+    """Median diameter against the distance to the nearest neighbours.
+
+    In a jammed monolayer the particles are touching or nearly so, which fixes
+    half the centre-to-centre distance at the outer radius. That makes this a
+    check on where the boundary was put which needs no ground truth, no
+    brightness model and no scale bar - only the centres, which are found
+    independently of the radius.
+
+    It is the check that caught the boundary sitting on the inner flank of the
+    shell wall: the yolk-shell field read 0.93 while its neighbours' walls said
+    it should read about 1. Comparing diameters between magnifications of the
+    same specimen cannot do that job - the neighbour spacing in nm differs by
+    up to 6% between two frames of one specimen, because a high-magnification
+    frame holds twenty particles and they are not the same twenty.
+
+    Nearest *three*, not nearest one: the single nearest neighbour is the
+    closest of six or so and reads systematically short.
+    """
+    if len(particles) < 8:
+        return None
+    centres = np.array([[p["center_x"], p["center_y"]] for p in particles], float)
+    radii = np.array([p["radius_px"] for p in particles], float)
+    gaps = np.hypot(centres[:, 0][:, None] - centres[:, 0][None, :],
+                    centres[:, 1][:, None] - centres[:, 1][None, :])
+    np.fill_diagonal(gaps, np.inf)
+    half_spacing = np.sort(gaps, axis=1)[:, :3].mean(axis=1) / 2.0
+    return float(np.median(radii) / np.median(half_spacing))
+
+
+# A circle on the inner flank of the shell wall packs at 0.93 and one that has
+# swallowed a neighbour's wall at 1.10; a correct one sits just under 1. The
+# bar is wide because a sparse field genuinely packs loose - it is here to
+# catch the boundary landing on the wrong feature, not to tune it.
+PACKING_RANGE = (0.88, 1.08)
+
+
 def main():
     results = {}
+    packing = {}
     print("실제 미크로그래프 3장 (서로 다른 시료 - 직경 비교는 참고용)")
     for label, filename, bar_nm in IMAGES:
         path = os.path.join(HERE, "real", filename)
@@ -96,9 +134,12 @@ def main():
         diameter = float(np.median([p["diameter"] for p in valid]))
         radius = float(np.median([p["radius_px"] for p in valid]))
         results[label] = diameter
+        packing[label] = packing_ratio(valid)
+        packed = ("-" if packing[label] is None else f"{packing[label]:.3f}")
         print(f"        {label:6s} 스케일바 {bar_px:3d}px = {bar_nm:.0f}nm "
               f"({nm_per_px:.3f} nm/px)   검출 {len(valid):4d}   "
-              f"반지름중앙 {radius:5.1f}px   직경중앙 {diameter:6.1f} nm")
+              f"반지름중앙 {radius:5.1f}px   직경중앙 {diameter:6.1f} nm   "
+              f"이웃대비 {packed}")
 
     agreeing = {k: v for k, v in results.items() if k != KNOWN_BAD}
     failures = []
@@ -109,6 +150,17 @@ def main():
         # sizes have no reason to match and matching proves nothing.
         print(f"\n  참고  {' / '.join(agreeing)} 직경 차이 {spread:.1f}% "
               "(서로 다른 시료이므로 판정 기준 아님)")
+
+    for label, ratio in packing.items():
+        if ratio is None:
+            continue
+        lo, hi = PACKING_RANGE
+        ok = lo <= ratio <= hi
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}: 원 지름이 이웃 간격의 "
+              f"{ratio:.3f}배 (허용 {lo}-{hi})")
+        if not ok:
+            failures.append(f"{label}: 이웃 대비 {ratio:.3f} — 경계가 쉘 벽 "
+                            "위가 아님")
 
     if KNOWN_BAD in results:
         # This image used to report 16 nm - image grain - and is now asserted

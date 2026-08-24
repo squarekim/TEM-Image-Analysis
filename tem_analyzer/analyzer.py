@@ -683,7 +683,8 @@ class ParticleAnalyzer:
         out[rows] = a[rows, lo] * (1.0 - w) + a[rows, hi] * w
         return out
 
-    def _outer_by_level(self, blurred, cx, cy, r0, angles, w, h, frac=None):
+    def _outer_by_level(self, blurred, cx, cy, r0, angles, w, h, frac=None,
+                        wall_only=False):
         """Radius where the rim's darkening has faded back to the surroundings.
 
         A gradient crest is only a boundary when the edge is sharp. Where the
@@ -709,7 +710,8 @@ class ParticleAnalyzer:
         far = radii >= 1.35 * r0
         core = (radii >= 0.5 * r0) & (radii <= 0.62 * r0)
         if not band.any() or not far.any():
-            return np.full(len(angles), np.nan), np.zeros(len(angles)), 0.0
+            return (np.full(len(angles), np.nan), np.zeros(len(angles)), 0.0,
+                    float("nan"))
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
@@ -731,6 +733,7 @@ class ParticleAnalyzer:
         s_out = np.zeros(len(angles))
         band_idx = np.flatnonzero(band)
         rim_votes = []
+        widths = []
 
         for i in range(len(angles)):
             if not np.isfinite(outside[i]) or inside[i].sum() < len(radii) * 0.5:
@@ -739,7 +742,26 @@ class ParticleAnalyzer:
             # The rim may be darker or brighter than its surroundings; take
             # whichever extreme departs further from the outside level.
             lo, hi = seg.min(), seg.max()
+            # An out-of-focus edge throws a bright Fresnel fringe just outside
+            # the particle, and on these micrographs the gaps between particles
+            # read *darker* than the interiors, so the fringe is the bigger
+            # departure from the surrounding level and this picks it as the rim
+            # - putting the boundary a fringe-width outside the particle. A
+            # caller that knows it is looking for a shell wall says so, because
+            # a wall is dark by construction.
             dark = (outside[i] - lo) >= (hi - outside[i])
+            if wall_only and np.isfinite(interior[i]):
+                # A shell wall is a trough: darker than the particle's inside
+                # *and* darker than what is beyond it. Asking only which
+                # extreme departs further from the level outside gets this
+                # wrong in both directions - a bright Fresnel fringe outruns
+                # the wall and gets picked as the boundary, while on bright
+                # particles against a dark ground the background itself is the
+                # darkest thing on the ray and is not a wall at all. Requiring
+                # a real depth on both sides separates them: the yolk-shell
+                # wall clears it four times over, the fringe and the background
+                # do not clear it at all.
+                dark = min(outside[i] - lo, interior[i] - lo) >= 0.25 * (hi - lo)
             k = band_idx[int(np.argmin(seg) if dark else np.argmax(seg))]
             extreme = prof[i, k]
             contrast = abs(outside[i] - extreme)
@@ -783,7 +805,42 @@ class ParticleAnalyzer:
                 t = 0.0 if b == a else (target - a) / (b - a)
                 return radii[prev] + t * (radii[step] - radii[prev])
 
-            r_outer_edge = half_height(outside[i], True)
+            if wall_only:
+                # The wall's outer flank rises to the shoulder immediately
+                # outside it, not to the level far away, and half-height has to
+                # be measured against the shoulder the flank actually climbs.
+                # Where an out-of-focus edge throws a bright fringe the two are
+                # not the same number at all - the fringe stands well above the
+                # background - and half-height against the distant level lands
+                # a fair way down the flank, inside the wall. Measured by how
+                # closely the circles then pack, that read the yolk-shell
+                # fields 5-8% small; against the shoulder they pack at 0.99.
+                out_seg = prof[i, k:]
+                # The *first* crest outward, not the highest one out there:
+                # past it the ray has left this particle, and the brightest
+                # thing further along is a neighbour's interior, which is
+                # brighter than the gap and would pull the target outwards
+                # again. Two consecutive falls to call a crest, so a single
+                # noisy pixel does not end the climb early.
+                stop = len(out_seg) - 1
+                for j in range(1, len(out_seg) - 2):
+                    if out_seg[j + 1] < out_seg[j] and out_seg[j + 2] < out_seg[j]:
+                        stop = j
+                        break
+                shoulder = float(out_seg[:stop + 1].max())
+                # Only a fringe, though. A crest has to stand clear of the
+                # surrounding level *and* fall back from it, or it is not a
+                # fringe at all - it is where a noisy profile happened to peak
+                # on its way to a flat background, and measuring half-height
+                # against it reads the particle 17% large (the grainy fixture,
+                # where this was found).
+                rise = shoulder - outside[i]
+                fall = shoulder - float(out_seg[stop:].min())
+                level = (shoulder if min(rise, fall) >= 0.25 * contrast
+                         else outside[i])
+                r_outer_edge = half_height(level, True)
+            else:
+                r_outer_edge = half_height(outside[i], True)
             r_inner_edge = (half_height(interior[i], False)
                             if np.isfinite(interior[i]) else None)
             if r_outer_edge is None:
@@ -810,8 +867,10 @@ class ParticleAnalyzer:
                 here = frac
             r_out[i] = r_inner_edge + here * (r_outer_edge - r_inner_edge)
             s_out[i] = contrast
+            widths.append(r_outer_edge - r_inner_edge)
         rim_frac = float(np.mean(rim_votes)) if rim_votes else 0.0
-        return r_out, s_out, rim_frac
+        width = float(np.median(widths)) if widths else float("nan")
+        return r_out, s_out, rim_frac, width
 
     def _boundary_candidates(self, cx, cy, angles, trace, score_thresh, r0,
                              outer_thresh=None, blurred=None):
@@ -825,7 +884,7 @@ class ParticleAnalyzer:
         rim_frac = 0.0
         if blurred is not None:
             h, w = blurred.shape
-            r_level, s_level, rim_frac = self._outer_by_level(
+            r_level, s_level, rim_frac, _width = self._outer_by_level(
                 blurred, cx, cy, r0, angles, w, h, frac=self.edge_level)
             if np.isfinite(r_level).sum() >= 8:
                 r_outer, s_outer = r_level, s_level
@@ -1715,17 +1774,10 @@ class ParticleAnalyzer:
     #: snapping to it would swap one particle for another.
     SNAP_MAX_MOVE = 0.30
 
-    #: Smoothing before the wall is read, as a share of the particle's radius -
-    #: not a fixed number of pixels. Smoothing widens the dark band on both
-    #: flanks, so the point a given share across it lands on moves outward, and
-    #: it moves by the same *pixels* whatever the magnification: at a radius of
-    #: 60 px that inflated the diameter 2%, at 180 px only 0.5%, and the same
-    #: sample then measured differently at two magnifications for no reason but
-    #: the smoothing. Tying it to the radius makes the blur the same share of
-    #: the band at every magnification, and the disagreement went from 3.6 to
-    #: 1.3 percentage points. The value is the one a real micrograph needs
-    #: (sigma 1.5 px at the 26 px radius those particles have).
-    SNAP_SMOOTH_FRAC = 0.058
+    #: Smoothing before the wall is read, as a share of the wall's own
+    #: thickness. See `_snap_sigma` for why it is tied to that and not to the
+    #: radius or to a fixed number of pixels.
+    SNAP_SMOOTH_FRAC = 0.35
 
     def _snap_to_wall(self, particles, gray):
         """Put every boundary on the shell wall, whatever found the particle.
@@ -1752,30 +1804,39 @@ class ParticleAnalyzer:
         circle only towards where that rule already says the surface is. Twice,
         because the search window is set from the radius it starts with, and a
         circle that was well inside its wall gets a better window on the second
-        pass. On the three specimens photographed at two or three
-        magnifications, agreement between magnifications on the yolk-shell
-        sample goes from 7.9% to 1.3%; the two hollow-silica samples, which were
-        already being measured at their walls, move from 2.0% and 1.8% to 3.1%
-        and 2.2%. The spread across all three tightens to 1.3-3.1% where it had
-        been 1.8-7.9%. Solid particles have no wall for the rule to find and are
-        left alone.
+        pass. Solid particles have no wall for the rule to find and are left
+        alone.
+
+        Scored by how closely the circles pack - the diameter against half the
+        distance to the nearest neighbours, which needs no brightness model and
+        no scale bar, and which a jammed monolayer fixes at just under 1. The
+        yolk-shell sample read 0.93 / 0.98 / 0.98 at its three magnifications
+        and now reads 0.97 / 0.97 / 0.96; the two hollow-silica samples were
+        already close and stay there (0.99-1.03).
+
+        Comparing the *diameters* between magnifications, which is the obvious
+        check, cannot settle this and was misleading while it was believed. The
+        neighbour spacing in nm - which depends on the centres and the scale
+        bar, not on where the boundary is put - differs by up to 6% between two
+        magnifications of the same specimen, because the high-magnification
+        frame holds twenty particles and they are simply not the same twenty.
+        A rule tuned to make those diameters agree is tuned to a difference in
+        the specimen.
         """
         live = [p for p in particles if not p.get("excluded")]
         if not live:
             return
-        sigma = float(max(0.5, self.SNAP_SMOOTH_FRAC
-                          * np.median([p["radius_px"] for p in live])))
-        blurred = cv2.GaussianBlur(gray, (0, 0), sigma)
-        h, w = blurred.shape
+        h, w = gray.shape
         angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
+        blurred = cv2.GaussianBlur(gray, (0, 0), self._snap_sigma(gray, live, angles))
         for p in live:
             for _ in range(2):
                 r0 = p["radius_px"]
                 if r0 < 4:
                     break
-                r_ang, _s, rim_frac = self._outer_by_level(
+                r_ang, _s, rim_frac, _wd = self._outer_by_level(
                     blurred, p["center_x"], p["center_y"], r0, angles, w, h,
-                    frac=self.edge_level)
+                    frac=self.edge_level, wall_only=True)
                 seen = np.isfinite(r_ang)
                 if seen.mean() < self.SNAP_MIN_RAYS or rim_frac < self.RIM_MIN_RAYS:
                     break
@@ -1786,6 +1847,46 @@ class ParticleAnalyzer:
                 self._set_radius(p, r)
                 if abs(r / r0 - 1.0) < 0.01:
                     break
+
+    def _snap_sigma(self, gray, live, angles):
+        """How much to smooth before reading the wall: a share of the wall.
+
+        Not a fixed number of pixels, and not a share of the radius either.
+        Smoothing widens the dark band on both flanks, so the point a given
+        share across it lands on moves outward - and by how much depends on the
+        blur measured against *the band*, not against the particle. A fixed
+        pixel count therefore reads the same specimen differently at two
+        magnifications (2% at a radius of 60 px, 0.5% at 180). A share of the
+        radius fixes that but not the other half: a shell 15% of the radius
+        thick and one 7% thick then get the same blur relative to a particle
+        and twice the difference relative to the wall, which read the thin-
+        walled fixture 7% large while the thick-walled real sample needed
+        exactly that much smoothing to hold still.
+
+        So the wall is measured first, lightly, and the smoothing set from what
+        comes back. Both scales then follow the feature being measured, and the
+        thin-ring fixture and the real yolk-shell sample can be right at once.
+        """
+        h, w = gray.shape
+        radii = [p["radius_px"] for p in live]
+        light = cv2.GaussianBlur(gray, (0, 0), max(0.5, 0.02 * float(np.median(radii))))
+        # A sample is enough for a per-image median, and this pass is only here
+        # to set one number.
+        step = max(1, len(live) // 60)
+        widths = []
+        for p in live[::step]:
+            if p["radius_px"] < 4:
+                continue
+            _r, _s, _rim, width = self._outer_by_level(
+                light, p["center_x"], p["center_y"], p["radius_px"], angles, w, h,
+                frac=self.edge_level, wall_only=True)
+            if np.isfinite(width):
+                widths.append(width)
+        if not widths:
+            # No wall found anywhere - the snap will decline on every particle
+            # anyway, so this only has to be a sane number.
+            return max(0.5, 0.02 * float(np.median(radii)))
+        return float(max(0.5, self.SNAP_SMOOTH_FRAC * np.median(widths)))
 
     #: A circle may be moved onto its ring by at most this share of its radius.
     #: Beyond it the ring being fitted is more likely a neighbour's than its
