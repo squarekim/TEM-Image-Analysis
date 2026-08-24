@@ -576,6 +576,7 @@ class MainWindow(QMainWindow):
         self.lbl_core = QLabel("-")
         self.lbl_shell = QLabel("-")
         self.lbl_defect = QLabel("-")
+        self.lbl_irregular = QLabel("-")
         self.lbl_porosity = QLabel("-")
         stats_form.addRow("입자 수:", self.lbl_count)
         stats_form.addRow("평균 직경:", self.lbl_mean)
@@ -588,6 +589,7 @@ class MainWindow(QMainWindow):
         stats_form.addRow("코어 보유율:", self.lbl_core)
         stats_form.addRow("쉘 두께:", self.lbl_shell)
         stats_form.addRow("불량 (코어잔존/파손):", self.lbl_defect)
+        stats_form.addRow("비원형:", self.lbl_irregular)
         stats_form.addRow("공극률:", self.lbl_porosity)
         stats_group.setLayout(stats_form)
         right_layout.addWidget(stats_group)
@@ -776,6 +778,9 @@ class MainWindow(QMainWindow):
         if n_defect:
             msg += (f"  |  불량 {n_defect}개 (파란 안쪽 원) - 코어 잔존 또는 "
                     "내부 파손, 크기는 측정됨")
+        n_irreg = sum(1 for p in valid if p.get("irregular"))
+        if n_irreg:
+            msg += f"  |  비원형 {n_irreg}개 (자홍색 번호) - 길쭉하거나 뭉친 입자"
         n_overlap, _ = self._overlapping_pairs()
         if n_overlap:
             msg += f"  |  겹치는 검출 {n_overlap}쌍 (보라색) - 중복 여부 확인 필요"
@@ -880,10 +885,16 @@ class MainWindow(QMainWindow):
             txt = str(num)
             pos = (cx - 8 * len(txt), cy - 6)
             font_scale = 0.45 + 0.1 * scale
+            # A number in magenta says the boundary is not a circle - an
+            # elongated particle, or two fused - so its diameter means less
+            # than the others'. It goes on the number rather than the outline
+            # because the outline colour is already saying how well the edge
+            # was found, which is a different question.
+            ink = (255, 80, 255) if p.get("irregular") else (80, 255, 255)
             cv2.putText(display, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
                         font_scale, (0, 0, 0), 3)
             cv2.putText(display, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale, (80, 255, 255), 1)
+                        font_scale, ink, 1)
 
         legend = [("OK", (0, 220, 0)), ("Approx", (0, 220, 220)),
                   ("Overlap", (255, 0, 255)), ("Excluded", (0, 0, 255))]
@@ -1036,6 +1047,12 @@ class MainWindow(QMainWindow):
                 f"({stats['defect_ratio'] * 100:.1f}%)")
         else:
             self.lbl_defect.setText("0")
+        if stats.get("irregular_count"):
+            self.lbl_irregular.setText(
+                f"{stats['irregular_count']}/{stats['count']} "
+                f"({stats['irregular_ratio'] * 100:.1f}%)")
+        else:
+            self.lbl_irregular.setText("0")
         if "shell_mean" in stats:
             self.lbl_shell.setText(
                 f"{stats['shell_mean']:.2f} ± {stats['shell_std']:.2f} {u}"
@@ -1066,6 +1083,9 @@ class MainWindow(QMainWindow):
         has_defect_col = any(p.get("defect") for p in particles)
         if has_defect_col:
             headers += ["불량"]
+        has_irregular_col = any(p.get("irregular") for p in particles)
+        if has_irregular_col:
+            headers += ["비원형"]
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setSortingEnabled(False)
@@ -1093,6 +1113,10 @@ class MainWindow(QMainWindow):
             if has_defect_col:
                 self.table.setItem(i, col,
                                    QTableWidgetItem("불량" if p.get("defect") else ""))
+                col += 1
+            if has_irregular_col:
+                self.table.setItem(i, col,
+                                   QTableWidgetItem("비원형" if p.get("irregular") else ""))
         self.table.setSortingEnabled(True)
 
     def _update_histogram(self):
@@ -1125,7 +1149,7 @@ class MainWindow(QMainWindow):
             headers += [f"Inner Diameter ({u})", f"Shell Thickness ({u})", "Porosity"]
         if has_core:
             headers += ["Has Core"]
-        headers += ["Defect"]
+        headers += ["Defect", "Irregular"]
         ws_data.append(headers)
         for i, p in enumerate(particles):
             row = [i + 1, p["diameter"], p["radius_px"] * 2, p["area"],
@@ -1136,7 +1160,8 @@ class MainWindow(QMainWindow):
                         p.get("porosity")]
             if has_core:
                 row += ["Y" if p["has_core"] else "N"]
-            row += ["Y" if p.get("defect") else "N"]
+            row += ["Y" if p.get("defect") else "N",
+                    "Y" if p.get("irregular") else "N"]
             ws_data.append(row)
 
         ws_stats = wb.create_sheet("Statistics")
@@ -1162,6 +1187,9 @@ class MainWindow(QMainWindow):
         if "defect_count" in stats:
             ws_stats.append(["Defect Count", stats["defect_count"], ""])
             ws_stats.append(["Defect Ratio", stats["defect_ratio"], ""])
+        if "irregular_count" in stats:
+            ws_stats.append(["Irregular Count", stats["irregular_count"], ""])
+            ws_stats.append(["Irregular Ratio", stats["irregular_ratio"], ""])
 
         if self.nm_per_px:
             ws_stats.append([])

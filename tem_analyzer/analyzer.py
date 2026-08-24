@@ -2103,7 +2103,130 @@ class ParticleAnalyzer:
                 self._set_radius(p, r)
                 if abs(r / r0 - 1.0) < 0.01:
                     break
+        self._recentre_on_wall(live, blurred)
         self._level_across_wall(live, blurred, angles)
+        self._flag_irregular(live)
+
+    #: How far above the field's own median a wall fit has to sit before the
+    #: particle is called out as not round. Real fields run at a median of
+    #: 0.010-0.026 of the radius with a tail reaching 0.10-0.14, so the line is
+    #: drawn relative to the field and floored so that a very uniform sample
+    #: does not start flagging its own noise.
+    IRREGULAR_RMS_FACTOR = 3.0
+    IRREGULAR_RMS_FLOOR = 0.04
+
+    def _flag_irregular(self, live):
+        """Mark particles whose boundary is not a circle.
+
+        A diameter assumes a sphere. An elongated particle, or two fused
+        together, still gets a circle fitted to it and a number reported, and
+        nothing in the number says the shape it came from was not round - a
+        reader has to spot it by eye, and on a field of four hundred they will
+        not spot them all. How far the wall strays from the fitted circle says
+        it directly, and it is already measured while re-centring.
+        """
+        values = [p["wall_rms"] for p in live if "wall_rms" in p]
+        if len(values) < 8:
+            return
+        limit = max(self.IRREGULAR_RMS_FLOOR,
+                    self.IRREGULAR_RMS_FACTOR * float(np.median(values)))
+        for p in live:
+            p["irregular"] = bool(p.get("wall_rms", 0.0) > limit)
+
+    #: Smallest and largest centre move worth making once the wall band is
+    #: known, as a share of the radius. The floor is low because by this point
+    #: the search is confined to a band a few pixels wide around a wall the
+    #: field has already located, so a small answer is a real one rather than
+    #: the fit wandering; the earlier pass, which searches from scratch, keeps
+    #: its own much higher floor.
+    WALL_CENTRE_MIN_MOVE = 0.015
+    WALL_CENTRE_MAX_MOVE = 0.20
+
+    #: How ragged the fitted wall may be, as a share of the radius, before the
+    #: centre it implies is not worth trusting.
+    WALL_CENTRE_MAX_RMS = 0.05
+
+    def _recentre_on_wall(self, live, blurred, n_angles=180):
+        """Re-centre once more, now that the wall's radius is known.
+
+        The first re-centring searches for the ring from scratch, over a wide
+        band, so it has to insist on a large move before it believes itself -
+        a circle less than a sixteenth of a radius out is left alone, because
+        at that size the fit cannot tell a displaced circle from its own noise.
+        By this point the field has agreed where the wall is, to within a few
+        percent of the radius. Looking only in that band makes a small answer
+        trustworthy: the darkest point along each ray is this particle's own
+        wall by construction, so the circle through them is the particle's.
+
+        Half the field moves by less than 2% of a radius and it is not worth
+        arguing about, but the tail is: on a real yolk-shell field the worst
+        run to 16%, which is a circle visibly off its particle.
+        """
+        if len(live) < 8:
+            return
+        h, w = blurred.shape
+        angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        cos_a, sin_a = np.cos(angles), np.sin(angles)
+        found = []
+        for p in live:
+            r, vote = self._ring_radius(blurred, p["center_x"], p["center_y"],
+                                        p["radius_px"])
+            found.append(r / p["radius_px"]
+                         if r and vote >= self.RING_MIN_VOTE else None)
+        typical = [f for f in found if f]
+        if len(typical) < 8:
+            return
+        wall_at = float(np.median(typical))
+
+        for p in live:
+            r0 = p["radius_px"]
+            if r0 < 6:
+                continue
+            band = np.arange(r0 * wall_at * 0.82, r0 * wall_at * 1.18, 0.25)
+            if len(band) < 4:
+                continue
+            fx = p["center_x"] + np.outer(cos_a, band)
+            fy = p["center_y"] + np.outer(sin_a, band)
+            seen = ((fx >= 0) & (fx < w) & (fy >= 0) & (fy < h)).mean(axis=1) >= 0.95
+            if seen.sum() < n_angles * 0.5:
+                continue
+            prof = blurred[np.clip(fy, 0, h - 1).astype(int),
+                           np.clip(fx, 0, w - 1).astype(int)]
+            k = np.argmin(prof, axis=1)
+            px = (p["center_x"] + band[k] * cos_a)[seen]
+            py = (p["center_y"] + band[k] * sin_a)[seen]
+            ux = uy = rad = None
+            for _ in range(4):
+                design = np.column_stack([2 * px, 2 * py, np.ones(len(px))])
+                sol, *_ = np.linalg.lstsq(design, px ** 2 + py ** 2, rcond=None)
+                ux, uy = float(sol[0]), float(sol[1])
+                rad = float(np.sqrt(max(sol[2] + ux * ux + uy * uy, 1e-6)))
+                resid = np.abs(np.hypot(px - ux, py - uy) - rad)
+                keep = resid < 2.0 * np.median(resid) + 0.4
+                if keep.all() or keep.sum() < n_angles * 0.35:
+                    break
+                px, py = px[keep], py[keep]
+            if rad is None or rad <= 0:
+                continue
+            rms = float(np.median(np.abs(np.hypot(px - ux, py - uy) - rad))) / rad
+            p["wall_rms"] = rms
+            move = np.hypot(ux - p["center_x"], uy - p["center_y"]) / r0
+            if rms > self.WALL_CENTRE_MAX_RMS:
+                continue
+            if not (self.WALL_CENTRE_MIN_MOVE < move <= self.WALL_CENTRE_MAX_MOVE):
+                continue
+            dx = int(round(ux)) - p["center_x"]
+            dy = int(round(uy)) - p["center_y"]
+            if dx == 0 and dy == 0:
+                continue
+            p["center_x"] += dx
+            p["center_y"] += dy
+            p["wall_recentre"] = float(move)
+            if p.get("contour") is not None:
+                pts = p["contour"].reshape(-1, 2).astype(np.float32)
+                pts[:, 0] += dx
+                pts[:, 1] += dy
+                p["contour"] = pts.reshape(-1, 1, 2)
 
     #: How far a circle may sit from where the field as a whole sits across its
     #: wall, as a share of the wall's thickness, before it is brought into
@@ -3151,6 +3274,9 @@ class ParticleAnalyzer:
         defect_count = sum(1 for p in particles if p.get("defect"))
         stats["defect_count"] = defect_count
         stats["defect_ratio"] = defect_count / len(particles)
+        irregular_count = sum(1 for p in particles if p.get("irregular"))
+        stats["irregular_count"] = irregular_count
+        stats["irregular_ratio"] = irregular_count / len(particles)
         shelled = [p for p in particles if p.get("shell_thickness") is not None]
         if shelled:
             stats["shell_count"] = len(shelled)
