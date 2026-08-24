@@ -279,6 +279,7 @@ class ParticleAnalyzer:
 
         self._reject_implausible_interiors(particles, analysis_region)
         self._recentre_on_ring(particles, analysis_region)
+        self._snap_to_wall(particles, analysis_region)
         if self.sphere_edge:
             self._refine_by_sphere_edge(particles, analysis_region)
         self._reject_clipped(particles, analysis_region.shape)
@@ -1628,18 +1629,103 @@ class ParticleAnalyzer:
             r = self._sphere_edge_radius(blurred, p["center_x"], p["center_y"], r0)
             if r is None or not (0.7 * r0 <= r <= 1.4 * r0):
                 continue
-            scale = r / r0
-            p["radius_px"] = r
-            p["area_px"] = float(np.pi * r * r)
-            if self.nm_per_px:
-                p["diameter"] = 2.0 * r * self.nm_per_px
-            else:
-                p["diameter"] = 2.0 * r
-            if p.get("contour") is not None:
-                pts = p["contour"].reshape(-1, 2).astype(np.float64)
-                centre = np.array([p["center_x"], p["center_y"]], float)
-                p["contour"] = ((centre + (pts - centre) * scale)
-                                .reshape(-1, 1, 2).astype(np.float32))
+            self._set_radius(p, r)
+
+    def _set_radius(self, p, r):
+        """Move a boundary in or out, keeping its centre and outline shape."""
+        r0 = p["radius_px"]
+        if r0 <= 0:
+            return
+        p["radius_px"] = r
+        p["area_px"] = float(np.pi * r * r)
+        p["diameter"] = 2.0 * r * (self.nm_per_px or 1.0)
+        if p.get("contour") is not None:
+            pts = p["contour"].reshape(-1, 2).astype(np.float64)
+            centre = np.array([p["center_x"], p["center_y"]], float)
+            p["contour"] = ((centre + (pts - centre) * (r / r0))
+                            .reshape(-1, 1, 2).astype(np.float32))
+
+    #: A wall has to be resolved on this share of the rays before the boundary
+    #: is placed by it. Below that the median is taken over too few directions
+    #: to be a radius rather than a local reading.
+    SNAP_MIN_RAYS = 0.60
+
+    #: Largest move allowed, as a share of the radius. A wall further away than
+    #: this is not the particle's own - it is the neighbour behind the gap - and
+    #: snapping to it would swap one particle for another.
+    SNAP_MAX_MOVE = 0.30
+
+    #: Smoothing before the wall is read, as a share of the particle's radius -
+    #: not a fixed number of pixels. Smoothing widens the dark band on both
+    #: flanks, so the point a given share across it lands on moves outward, and
+    #: it moves by the same *pixels* whatever the magnification: at a radius of
+    #: 60 px that inflated the diameter 2%, at 180 px only 0.5%, and the same
+    #: sample then measured differently at two magnifications for no reason but
+    #: the smoothing. Tying it to the radius makes the blur the same share of
+    #: the band at every magnification, and the disagreement went from 3.6 to
+    #: 1.3 percentage points. The value is the one a real micrograph needs
+    #: (sigma 1.5 px at the 26 px radius those particles have).
+    SNAP_SMOOTH_FRAC = 0.058
+
+    def _snap_to_wall(self, particles, gray):
+        """Put every boundary on the shell wall, whatever found the particle.
+
+        Which of the two fitted transitions a particle's diameter comes from is
+        voted on once per image (see `_select_boundary`), and on six of nine
+        real micrographs the vote went against the wall - so every particle in
+        those images was measured at the *inner flank* of its wall, with the
+        whole dark band lying outside the circle. A reader spotted the worst of
+        them by eye; measuring it afterwards, the median circle on one field was
+        7.2% small and the worst 15%.
+
+        The vote is not wrong to be cautious: it decides which feature is the
+        boundary, and getting that wrong on a whole image is expensive. But it
+        decides it before anything has been rejected, from evidence that a
+        packed field withholds - on the contact sides there is no background for
+        the profile to recover to, so the outer transition simply is not there
+        to be voted for. This asks the narrower question afterwards, of each
+        surviving particle on its own: where is *your* wall, and is the circle
+        on it? A particle whose wall is not resolved keeps what it had.
+
+        It reads the same per-ray rule the boundary is defined by - contact
+        sides at the wall's middle, free sides at its outer edge - so it moves a
+        circle only towards where that rule already says the surface is. Twice,
+        because the search window is set from the radius it starts with, and a
+        circle that was well inside its wall gets a better window on the second
+        pass. On the three specimens photographed at two or three
+        magnifications, agreement between magnifications on the yolk-shell
+        sample goes from 7.9% to 1.3%; the two hollow-silica samples, which were
+        already being measured at their walls, move from 2.0% and 1.8% to 3.1%
+        and 2.2%. The spread across all three tightens to 1.3-3.1% where it had
+        been 1.8-7.9%. Solid particles have no wall for the rule to find and are
+        left alone.
+        """
+        live = [p for p in particles if not p.get("excluded")]
+        if not live:
+            return
+        sigma = float(max(0.5, self.SNAP_SMOOTH_FRAC
+                          * np.median([p["radius_px"] for p in live])))
+        blurred = cv2.GaussianBlur(gray, (0, 0), sigma)
+        h, w = blurred.shape
+        angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
+        for p in live:
+            for _ in range(2):
+                r0 = p["radius_px"]
+                if r0 < 4:
+                    break
+                r_ang, _s, rim_frac = self._outer_by_level(
+                    blurred, p["center_x"], p["center_y"], r0, angles, w, h,
+                    frac=self.edge_level)
+                seen = np.isfinite(r_ang)
+                if seen.mean() < self.SNAP_MIN_RAYS or rim_frac < self.RIM_MIN_RAYS:
+                    break
+                r = float(np.median(r_ang[seen]))
+                if not (1.0 - self.SNAP_MAX_MOVE <= r / r0 <= 1.0 + self.SNAP_MAX_MOVE):
+                    break
+                p["wall_offset"] = float(r / r0 - 1.0)
+                self._set_radius(p, r)
+                if abs(r / r0 - 1.0) < 0.01:
+                    break
 
     #: A circle may be moved onto its ring by at most this share of its radius.
     #: Beyond it the ring being fitted is more likely a neighbour's than its
