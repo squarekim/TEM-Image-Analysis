@@ -351,6 +351,13 @@ class MainWindow(QMainWindow):
         self.scale_text = None
         self.unit = "nm"
         self._measuring_shown = None
+        #: Hand-measurement calibration. When calibrating, a drag across a
+        #: particle records its diameter; applying them fixes where the edge is
+        #: for the whole field, and the place is remembered so the next image
+        #: of the same specimen reuses it.
+        self._calib_mode = False
+        self._calib_refs = []
+        self.wall_place = None
 
         self._build_ui()
         self.statusBar().showMessage("이미지를 로드해주세요.")
@@ -401,7 +408,7 @@ class MainWindow(QMainWindow):
 
         self.image_label = ImageLabel()
         self.image_label.click_callback = self._on_image_click
-        self.image_label.measure_callback = self._on_scalebar_measured
+        self.image_label.measure_callback = self._on_measure_drag
         self.image_label.measuring_callback = self._on_scalebar_measuring
         self.image_label.anchor_callback = self._on_measure_anchor
         self.image_label.zoom_callback = self._on_zoom_changed
@@ -571,6 +578,36 @@ class MainWindow(QMainWindow):
         param_group.setLayout(param_form)
         right_layout.addWidget(param_group)
 
+        calib_group = QGroupBox("경계 보정 (직접 재기)")
+        calib_form = QFormLayout()
+        self.btn_calib = QPushButton("지름 재기 시작")
+        self.btn_calib.setCheckable(True)
+        self.btn_calib.setEnabled(False)
+        self.btn_calib.setToolTip(
+            "흐릿한 쉘 벽 위 어디가 '입자 표면'인지는 보는 사람마다 다릅니다.\n"
+            "이 버튼을 누른 뒤 입자 몇 개의 지름을 가로질러 드래그하면,\n"
+            "그 판단을 기준으로 전체 입자의 지름을 다시 맞춥니다.\n"
+            "한 번 보정하면 같은 시료의 다른 배율 이미지에도 그대로 적용됩니다.")
+        self.btn_calib.toggled.connect(self._toggle_calib_mode)
+        calib_form.addRow(self.btn_calib)
+
+        self.lbl_calib = QLabel("측정 0개")
+        calib_form.addRow("수집:", self.lbl_calib)
+
+        calib_btns = QHBoxLayout()
+        self.btn_calib_apply = QPushButton("보정 적용")
+        self.btn_calib_apply.setEnabled(False)
+        self.btn_calib_apply.clicked.connect(self._apply_calibration)
+        calib_btns.addWidget(self.btn_calib_apply)
+        self.btn_calib_reset = QPushButton("초기화")
+        self.btn_calib_reset.setEnabled(False)
+        self.btn_calib_reset.clicked.connect(self._reset_calibration)
+        calib_btns.addWidget(self.btn_calib_reset)
+        calib_form.addRow(calib_btns)
+
+        calib_group.setLayout(calib_form)
+        right_layout.addWidget(calib_group)
+
         stats_group = QGroupBox("통계 결과")
         stats_form = QFormLayout()
         self.lbl_count = QLabel("-")
@@ -686,6 +723,89 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"{note}  '실제 길이'가 {real:g} {unit}가 맞는지 확인하세요.")
 
+    def _on_measure_drag(self, start, end):
+        # One drag mechanism, two purposes: measuring the scale bar, or
+        # measuring a particle's diameter for calibration. Which one depends on
+        # the mode the user turned on.
+        if self._calib_mode:
+            self._on_calib_measured(start, end)
+        else:
+            self._on_scalebar_measured(start, end)
+
+    def _toggle_calib_mode(self, on):
+        # Calibration and scale-bar measuring share the drag, so only one can
+        # be armed at a time.
+        if on and self.btn_measure.isChecked():
+            self.btn_measure.setChecked(False)
+        self._calib_mode = on
+        self.image_label.measure_mode = on or self.btn_measure.isChecked()
+        self.image_label.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+        self.btn_calib.setText("지름 재기 중지" if on else "지름 재기 시작")
+        if on:
+            self.statusBar().showMessage(
+                "입자의 지름을 가로질러 드래그하세요. 몇 개 재고 '보정 적용'을 누르면 "
+                "전체 입자가 그 기준으로 다시 측정됩니다.")
+
+    def _on_calib_measured(self, start, end):
+        length = math.hypot(end[0] - start[0], end[1] - start[1])
+        if length < 3:
+            return
+        cx = (start[0] + end[0]) / 2.0
+        cy = (start[1] + end[1]) / 2.0
+        self._calib_refs.append((cx, cy, length))
+        self.btn_calib_apply.setEnabled(len(self._calib_refs) >= 3)
+        self.btn_calib_reset.setEnabled(True)
+        u = self.unit
+        dia = length * (self.nm_per_px or 1.0)
+        self.lbl_calib.setText(f"측정 {len(self._calib_refs)}개 "
+                               f"(마지막 {dia:.1f} {u})")
+        self._redraw_results()
+        need = max(0, 3 - len(self._calib_refs))
+        tail = f" — {need}개 더 재면 적용할 수 있습니다" if need else " — '보정 적용' 준비됨"
+        self.statusBar().showMessage(f"측정 {len(self._calib_refs)}개 수집{tail}.")
+
+    def _apply_calibration(self):
+        if not self.particles or len(self._calib_refs) < 3:
+            return
+        analyzer = ParticleAnalyzer(
+            nm_per_px=self.nm_per_px,
+            edge_level=("auto" if self.chk_edge_auto.isChecked()
+                        else self.spin_edge.value() / 100.0),
+            sphere_edge=self.chk_sphere_edge.isChecked())
+        before = np.median([p["diameter"] for p in self._valid_particles()]) \
+            if self._valid_particles() else 0.0
+        # Only compute the place here; the re-analysis below applies it through
+        # the full pipeline, so the number the user sees now is exactly what a
+        # later re-run (or the same specimen at another magnification) gives.
+        place, used = analyzer.calibrate_to_measurements(
+            self.particles, self._calib_refs, self.original_image, apply=False)
+        if place is None:
+            self.statusBar().showMessage(
+                "보정 실패: 측정한 위치에서 쉘 벽을 찾지 못했습니다. "
+                "입자 경계가 뚜렷한 곳을 재보세요.")
+            return
+        self.wall_place = place
+        self.btn_calib.setChecked(False)
+        self._run_analysis()
+        after = np.median([p["diameter"] for p in self._valid_particles()]) \
+            if self._valid_particles() else 0.0
+        self.lbl_calib.setText(f"적용됨 · 벽 위치 {place:.2f} (참조 {used}개)")
+        u = self.unit
+        self.statusBar().showMessage(
+            f"보정 적용: 벽 위치 {place:.2f}로 전체 재측정. "
+            f"D50 {before:.1f} → {after:.1f} {u}. "
+            "같은 시료의 다른 배율 이미지에도 자동 적용됩니다.")
+
+    def _reset_calibration(self):
+        self._calib_refs = []
+        self.wall_place = None
+        self.btn_calib_apply.setEnabled(False)
+        self.btn_calib_reset.setEnabled(False)
+        self.lbl_calib.setText("측정 0개")
+        if self.original_image is not None and self.particles:
+            self._run_analysis()
+        self.statusBar().showMessage("보정을 초기화했습니다. 자동 판단으로 되돌립니다.")
+
     def _load_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "TEM 이미지 열기", "",
@@ -760,6 +880,10 @@ class MainWindow(QMainWindow):
                 edge_level=("auto" if self.chk_edge_auto.isChecked()
                             else self.spin_edge.value() / 100.0),
                 sphere_edge=self.chk_sphere_edge.isChecked())
+            # Carry a hand calibration, if one has been set, into this run - so
+            # re-analysing, or opening the same specimen at another
+            # magnification, keeps the edge where the user put it.
+            analyzer.wall_place = self.wall_place
             self.particles = analyzer.analyze(
                 self.original_image,
                 min_area_px=self.spin_min_area.value(),
@@ -783,6 +907,7 @@ class MainWindow(QMainWindow):
         self._update_histogram()
         valid = self._valid_particles()
         self.btn_export.setEnabled(bool(valid))
+        self.btn_calib.setEnabled(bool(valid))
         n_exc = len(self.particles) - len(valid)
         n_approx = sum(1 for p in valid if p.get("approx"))
         msg = f"분석 완료: {len(valid)}개 입자 검출"
@@ -927,6 +1052,16 @@ class MainWindow(QMainWindow):
             cv2.putText(display, label, (lx + 24, 26), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (255, 255, 255), 1)
             lx += 24 + 13 * len(label) + 16
+
+        # The diameters measured for calibration, drawn as cyan lines through
+        # their centres so the user can see what they have collected so far.
+        for cx0, cy0, length in self._calib_refs:
+            c = (int(cx0 * scale), int(cy0 * scale))
+            half = int(length * scale / 2)
+            cv2.line(display, (c[0] - half, c[1]), (c[0] + half, c[1]),
+                     (255, 255, 0), max(1, thickness))
+            cv2.circle(display, c, max(2, thickness), (255, 255, 0), -1)
+
         self.result_image = display
         self.btn_save_image.setEnabled(True)
         self._display_image(display)

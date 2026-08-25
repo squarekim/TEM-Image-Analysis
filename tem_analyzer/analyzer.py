@@ -199,6 +199,13 @@ class ParticleAnalyzer:
         #: Place the boundary by extrapolating the sphere's own edge profile
         #: rather than by a brightness threshold. See `_sphere_edge_radius`.
         self.sphere_edge = bool(sphere_edge)
+        #: Where across the shell wall the surface sits, 0 at the inner flank
+        #: and 1 at the outer, as fixed by hand measurement. None means let the
+        #: field decide by its own median (the default, unchanged behaviour);
+        #: a float pins every particle to that place, which is how a person's
+        #: ImageJ or click measurement is carried to the whole field. See
+        #: `calibrate_to_measurements`.
+        self.wall_place = None
         #: Optional callback(fraction, label) for a progress gauge. A dense
         #: field takes tens of seconds and the caller (the GUI) otherwise looks
         #: frozen; this lets it draw a bar. It is advisory only - the numbers
@@ -2391,7 +2398,16 @@ class ParticleAnalyzer:
             return
         places = {k: (p["radius_px"] - spans[k][0]) / (spans[k][1] - spans[k][0])
                   for p in live if (k := id(p)) in spans}
-        common = float(np.median(list(places.values())))
+        # Normally the field decides where across its wall the surface sits, by
+        # its own median. When the user has measured a few particles by hand -
+        # in ImageJ or by clicking in the viewer - `wall_place` holds where
+        # *they* put the edge, and every particle is brought to that instead.
+        # This is the whole point of the hand calibration: the surface on a
+        # blurred shell wall is genuinely ambiguous, so the person's judgement
+        # is the definition, and the field only has to be made consistent with
+        # it.
+        common = (self.wall_place if self.wall_place is not None
+                  else float(np.median(list(places.values()))))
         for p in live:
             k = id(p)
             if k not in spans:
@@ -2404,6 +2420,82 @@ class ParticleAnalyzer:
                 continue
             p["wall_place"] = float(places[k])
             self._set_radius(p, r)
+
+    def calibrate_to_measurements(self, particles, references, gray, apply=True):
+        """Set the wall place from hand measurements, and re-size every particle.
+
+        ``references`` is a list of (cx, cy, diameter_px) the user measured -
+        by drawing across a particle in the viewer, or from ImageJ. Each is
+        matched to the nearest detection, and its diameter is read as a place
+        across that particle's own shell wall: 0 at the inner flank, 1 at the
+        outer. The median of those places becomes the field's edge convention,
+        stored on the analyzer so a later run - the same specimen at another
+        magnification - can reuse it without measuring again.
+
+        The surface on a blurred shell wall is genuinely ambiguous, so this
+        does not overrule the person; it takes their judgement as the
+        definition and makes the whole field consistent with it. Returns the
+        place, and how many references it could actually use.
+        """
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY) if gray.ndim == 3 else gray
+        cutoff = self._find_scalebar_top(gray)
+        region = gray[:cutoff, :]
+        live = [p for p in particles if not p.get("excluded")]
+        if not live or not references:
+            return None, 0
+        h, w = region.shape
+        angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
+        blurred = cv2.GaussianBlur(region, (0, 0),
+                                   self._snap_sigma(region, live, angles))
+        wall_at = self._field_wall_fraction(blurred, live)
+
+        def span(p):
+            _r, _s, rim, (inner, outer) = self._outer_by_level(
+                blurred, p["center_x"], p["center_y"], p["radius_px"], angles,
+                w, h, frac=self.edge_level, wall_only=True, wall_at=wall_at)
+            if not (np.isfinite(inner) and np.isfinite(outer) and outer > inner):
+                return None
+            return inner, outer
+
+        places = []
+        for cx, cy, dia in references:
+            best, best_d = None, None
+            for p in live:
+                d = np.hypot(p["center_x"] - cx, p["center_y"] - cy)
+                if best_d is None or d < best_d:
+                    best, best_d = p, d
+            if best is None or best_d > best["radius_px"]:
+                continue
+            s = span(best)
+            if s is None:
+                continue
+            inner, outer = s
+            places.append((dia / 2.0 - inner) / (outer - inner))
+        if not places:
+            return None, 0
+        self.wall_place = float(np.median(places))
+        if not apply:
+            # The caller will re-run the whole analysis with this place set,
+            # which is the authoritative result; there is no point re-sizing
+            # the current particles first only to discard them.
+            return self.wall_place, len(places)
+
+        # Re-size the field to the calibrated place. The span is read fresh
+        # from the image rather than from the current radius, so this is the
+        # same computation the levelling step does, only with the place fixed.
+        for p in live:
+            if p["radius_px"] < 4:
+                continue
+            s = span(p)
+            if s is None:
+                continue
+            inner, outer = s
+            r = inner + self.wall_place * (outer - inner)
+            if 0.5 <= r / p["radius_px"] <= 1.8:
+                p["wall_place"] = self.wall_place
+                p["calibrated"] = True
+                self._set_radius(p, r)
+        return self.wall_place, len(places)
 
     def _snap_sigma(self, gray, live, angles):
         """How much to smooth before reading the wall: a share of the wall.
