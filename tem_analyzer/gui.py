@@ -23,6 +23,7 @@ import openpyxl
 from .analyzer import (
     ScaleBarDetector, ParticleAnalyzer, HAS_TESSERACT, load_image, save_image,
 )
+from . import config
 
 
 class ImageLabel(QLabel):
@@ -360,7 +361,16 @@ class MainWindow(QMainWindow):
         self.wall_place = None
 
         self._build_ui()
-        self.statusBar().showMessage("이미지를 로드해주세요.")
+        # Carry the last session's settings - above all a hand calibration -
+        # into this one. A missing or broken file is ignored (load returns {}),
+        # so a first run just keeps the defaults.
+        loaded = self._load_and_apply_settings(config.default_path(), quiet=True)
+        if loaded and self.wall_place is not None:
+            self.statusBar().showMessage(
+                f"이전 보정을 불러왔습니다 (벽 위치 {self.wall_place:.2f}). "
+                "이미지를 로드해주세요.")
+        else:
+            self.statusBar().showMessage("이미지를 로드해주세요.")
 
     def _build_ui(self):
         central = QWidget()
@@ -605,6 +615,23 @@ class MainWindow(QMainWindow):
         calib_btns.addWidget(self.btn_calib_reset)
         calib_form.addRow(calib_btns)
 
+        # Persist a calibration between launches. It saves to a file on apply
+        # and loads it back on startup, so the boundary the user fixed once
+        # keeps applying; the explicit buttons export or import a named file so
+        # a different specimen can have its own saved calibration.
+        settings_btns = QHBoxLayout()
+        self.btn_settings_save = QPushButton("설정 저장…")
+        self.btn_settings_save.setToolTip(
+            "현재 보정값과 분석 파라미터를 파일로 저장합니다 (배율은 제외).")
+        self.btn_settings_save.clicked.connect(self._save_settings_as)
+        settings_btns.addWidget(self.btn_settings_save)
+        self.btn_settings_load = QPushButton("설정 불러오기…")
+        self.btn_settings_load.setToolTip(
+            "저장한 보정·파라미터 파일을 불러옵니다.")
+        self.btn_settings_load.clicked.connect(self._load_settings_from)
+        settings_btns.addWidget(self.btn_settings_load)
+        calib_form.addRow(settings_btns)
+
         calib_group.setLayout(calib_form)
         right_layout.addWidget(calib_group)
 
@@ -787,6 +814,9 @@ class MainWindow(QMainWindow):
         self.wall_place = place
         self.btn_calib.setChecked(False)
         self._run_analysis()
+        # Persist immediately, so the calibration survives a restart without the
+        # user having to remember to save it.
+        self._save_settings(config.default_path(), quiet=True)
         after = np.median([p["diameter"] for p in self._valid_particles()]) \
             if self._valid_particles() else 0.0
         self.lbl_calib.setText(f"적용됨 · 벽 위치 {place:.2f} (참조 {used}개)")
@@ -804,7 +834,97 @@ class MainWindow(QMainWindow):
         self.lbl_calib.setText("측정 0개")
         if self.original_image is not None and self.particles:
             self._run_analysis()
+        # Clearing is a deliberate act, so it clears the persisted file too;
+        # otherwise the next launch would silently reapply the old calibration.
+        self._save_settings(config.default_path(), quiet=True)
         self.statusBar().showMessage("보정을 초기화했습니다. 자동 판단으로 되돌립니다.")
+
+    # -- settings persistence -------------------------------------------------
+
+    def _settings_dict(self):
+        """Gather the current configuration into a plain dict (no scale)."""
+        return {
+            "wall_place": self.wall_place,
+            "min_area": self.spin_min_area.value(),
+            "max_area": self.spin_max_area.value(),
+            "circularity": self.spin_circularity.value(),
+            "hollow": self.chk_hollow.isChecked(),
+            "watershed": self.chk_watershed.isChecked(),
+            "core": self.chk_core.isChecked(),
+            "shell": self.chk_shell.isChecked(),
+            "sphere_edge": self.chk_sphere_edge.isChecked(),
+            "edge_auto": self.chk_edge_auto.isChecked(),
+            "edge_level": self.spin_edge.value(),
+        }
+
+    def _apply_settings_dict(self, d):
+        """Push a loaded settings dict onto the widgets and the calibration."""
+        if "min_area" in d:
+            self.spin_min_area.setValue(int(d["min_area"]))
+        if "max_area" in d:
+            self.spin_max_area.setValue(int(d["max_area"]))
+        if "circularity" in d:
+            self.spin_circularity.setValue(float(d["circularity"]))
+        if "hollow" in d:
+            self.chk_hollow.setChecked(bool(d["hollow"]))
+        if "watershed" in d:
+            self.chk_watershed.setChecked(bool(d["watershed"]))
+        if "core" in d:
+            self.chk_core.setChecked(bool(d["core"]))
+        if "shell" in d:
+            self.chk_shell.setChecked(bool(d["shell"]))
+        if "sphere_edge" in d:
+            self.chk_sphere_edge.setChecked(bool(d["sphere_edge"]))
+        if "edge_auto" in d:
+            self.chk_edge_auto.setChecked(bool(d["edge_auto"]))
+        if "edge_level" in d:
+            self.spin_edge.setValue(int(d["edge_level"]))
+        if "wall_place" in d:
+            wp = d["wall_place"]
+            self.wall_place = float(wp) if wp is not None else None
+            if self.wall_place is not None:
+                self.lbl_calib.setText(f"불러옴 · 벽 위치 {self.wall_place:.2f}")
+                self.btn_calib_reset.setEnabled(True)
+
+    def _save_settings(self, path, quiet=False):
+        try:
+            config.save_settings(path, self._settings_dict())
+        except OSError as e:
+            if not quiet:
+                self.statusBar().showMessage(f"설정 저장 실패: {e}")
+            return False
+        if not quiet:
+            self.statusBar().showMessage(f"설정을 저장했습니다: {path}")
+        return True
+
+    def _load_and_apply_settings(self, path, quiet=False):
+        d = config.load_settings(path)
+        if not d:
+            if not quiet:
+                self.statusBar().showMessage("불러올 설정이 없습니다.")
+            return False
+        self._apply_settings_dict(d)
+        return True
+
+    def _save_settings_as(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "설정 저장", "tem_settings.json", "설정 파일 (*.json)")
+        if path:
+            self._save_settings(path)
+
+    def _load_settings_from(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "설정 불러오기", "", "설정 파일 (*.json);;모든 파일 (*)")
+        if not path:
+            return
+        if self._load_and_apply_settings(path):
+            note = (f"벽 위치 {self.wall_place:.2f} 적용됨"
+                    if self.wall_place is not None else "보정 없음")
+            msg = f"설정을 불러왔습니다 ({note})."
+            if self.original_image is not None and self.particles:
+                self._run_analysis()
+                msg += " 재분석했습니다."
+            self.statusBar().showMessage(msg)
 
     def _load_image(self):
         path, _ = QFileDialog.getOpenFileName(
