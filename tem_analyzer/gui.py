@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
     QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox, QSplitter,
     QMessageBox, QHeaderView, QComboBox, QCheckBox, QProgressBar,
+    QInputDialog,
 )
 from PyQt5.QtCore import Qt, QPoint, QRectF
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
@@ -24,6 +25,8 @@ from .analyzer import (
     ScaleBarDetector, ParticleAnalyzer, HAS_TESSERACT, load_image, save_image,
 )
 from . import config
+from . import labels as labelstore
+from datetime import datetime
 
 
 class ImageLabel(QLabel):
@@ -359,6 +362,14 @@ class MainWindow(QMainWindow):
         self._calib_mode = False
         self._calib_refs = []
         self.wall_place = None
+        #: Ground-truth archive: hand-measured true diameters, per image, bound
+        #: to positions rather than particle numbers. Purely data - it never
+        #: changes what the analyzer measures; it records what is true so the
+        #: measurement can be scored against it.
+        self._label_mode = False
+        self._labels = labelstore.load(labelstore.default_path())
+        self._image_path = None
+        self._image_key = None
 
         self._build_ui()
         # Carry the last session's settings - above all a hand calibration -
@@ -634,6 +645,35 @@ class MainWindow(QMainWindow):
 
         calib_group.setLayout(calib_form)
         right_layout.addWidget(calib_group)
+
+        label_group = QGroupBox("참값 라벨링 (데이터 기록)")
+        label_form = QFormLayout()
+        self.btn_label = QPushButton("라벨 클릭 시작")
+        self.btn_label.setCheckable(True)
+        self.btn_label.setEnabled(False)
+        self.btn_label.setToolTip(
+            "입자를 클릭해 그 자리에 '참 지름'을 기록합니다. 측정값은 바뀌지 않고,\n"
+            "참값만 데이터로 쌓입니다(이미지+위치에 묶여 재분석해도 유지).\n"
+            "이미 라벨한 곳을 다시 클릭하면 수정, 0을 입력하면 삭제됩니다.")
+        self.btn_label.toggled.connect(self._toggle_label_mode)
+        label_form.addRow(self.btn_label)
+
+        self.lbl_label_count = QLabel("이 이미지 라벨 0개")
+        label_form.addRow("기록:", self.lbl_label_count)
+
+        label_btns = QHBoxLayout()
+        self.btn_label_report = QPushButton("정확도 리포트")
+        self.btn_label_report.setEnabled(False)
+        self.btn_label_report.clicked.connect(self._accuracy_report)
+        label_btns.addWidget(self.btn_label_report)
+        self.btn_label_export = QPushButton("CSV 내보내기")
+        self.btn_label_export.setEnabled(False)
+        self.btn_label_export.clicked.connect(self._export_labels_csv)
+        label_btns.addWidget(self.btn_label_export)
+        label_form.addRow(label_btns)
+
+        label_group.setLayout(label_form)
+        right_layout.addWidget(label_group)
 
         stats_group = QGroupBox("통계 결과")
         stats_form = QFormLayout()
@@ -926,6 +966,152 @@ class MainWindow(QMainWindow):
                 msg += " 재분석했습니다."
             self.statusBar().showMessage(msg)
 
+    # -- ground-truth labelling (archive only, never overrides measurement) ---
+
+    def _current_labels(self):
+        if self._image_key is None:
+            return []
+        return labelstore.labels_for(self._labels, self._image_key)
+
+    def _refresh_label_count(self):
+        n = len(self._current_labels())
+        self.lbl_label_count.setText(f"이 이미지 라벨 {n}개")
+        self.btn_label_report.setEnabled(n > 0 and bool(self.particles))
+        self.btn_label_export.setEnabled(bool(self._labels))
+
+    def _toggle_label_mode(self, on):
+        # Labelling clicks a particle; it must not fight the scale-bar or
+        # calibration drag, so arming it disarms those.
+        if on:
+            if self.btn_measure.isChecked():
+                self.btn_measure.setChecked(False)
+            if self.btn_calib.isChecked():
+                self.btn_calib.setChecked(False)
+            self.image_label.measure_mode = False
+        self._label_mode = on
+        self.image_label.setCursor(Qt.PointingHandCursor if on else Qt.ArrowCursor)
+        self.btn_label.setText("라벨 클릭 중지" if on else "라벨 클릭 시작")
+        if on:
+            self.statusBar().showMessage(
+                "입자를 클릭해 참 지름을 입력하세요. 측정값은 그대로 두고 참값만 "
+                "기록됩니다. 같은 곳 다시 클릭=수정, 0 입력=삭제.")
+
+    def _label_click(self, ox, oy):
+        if self.original_image is None:
+            return
+        # Snap to the nearest detection so the label sits on a particle centre,
+        # but fall back to the click itself so a missed particle can still be
+        # recorded. The matched detection's diameter is offered as a starting
+        # value and stored beside the true one, so the error is kept with the
+        # label rather than recomputed against a later, different analysis.
+        best, best_d = None, None
+        for p in self._valid_particles():
+            d = np.hypot(p["center_x"] - ox, p["center_y"] - oy)
+            if best_d is None or d < best_d:
+                best, best_d = p, d
+        prog_nm = None
+        cx, cy = float(ox), float(oy)
+        if best is not None and best_d <= best["radius_px"] * 1.2:
+            cx, cy = float(best["center_x"]), float(best["center_y"])
+            prog_nm = float(best["diameter"])
+
+        existing = labelstore.nearest(self._current_labels(), cx, cy)
+        near = (existing is not None
+                and (existing["cx"] - cx) ** 2 + (existing["cy"] - cy) ** 2
+                <= labelstore.REPLACE_RADIUS ** 2)
+        u = self.unit
+        preset = (existing["true_nm"] if near
+                  else (prog_nm if prog_nm is not None else 0.0))
+        value, ok = QInputDialog.getDouble(
+            self, "참값 입력",
+            (f"참 지름 ({u}):   [측정값 {prog_nm:.1f} {u}]" if prog_nm is not None
+             else f"참 지름 ({u}):") + "\n(0 = 이 라벨 삭제)",
+            float(preset), 0.0, 1e6, 2)
+        if not ok:
+            return
+        if value <= 0:
+            if labelstore.remove_near(self._labels, self._image_key, cx, cy):
+                self._save_labels()
+                self._draw_results()
+                self._refresh_label_count()
+                self.statusBar().showMessage("라벨을 삭제했습니다.")
+            return
+        _, replaced = labelstore.add_or_replace(
+            self._labels, self._image_key, cx, cy, value, prog_nm,
+            when=datetime.now().isoformat(timespec="seconds"))
+        self._save_labels()
+        self._draw_results()
+        self._refresh_label_count()
+        err = f"  (측정 {prog_nm:.1f} → 오차 {(prog_nm - value) / value * 100:+.1f}%)" \
+            if prog_nm else ""
+        self.statusBar().showMessage(
+            (f"라벨 {'수정' if replaced else '기록'}: {value:.1f} {u}{err}. "
+             f"이 이미지 {len(self._current_labels())}개."))
+
+    def _save_labels(self):
+        try:
+            labelstore.save(labelstore.default_path(), self._labels)
+        except OSError as e:
+            self.statusBar().showMessage(f"라벨 저장 실패: {e}")
+
+    def _label_errors(self):
+        """Match each label on this image to the nearest current detection."""
+        pairs = []
+        valid = self._valid_particles()
+        for lab in self._current_labels():
+            best, best_d = None, None
+            for p in valid:
+                d = np.hypot(p["center_x"] - lab["cx"], p["center_y"] - lab["cy"])
+                if best_d is None or d < best_d:
+                    best, best_d = p, d
+            if best is not None and best_d <= best["radius_px"]:
+                pairs.append((lab["true_nm"], float(best["diameter"])))
+        return pairs
+
+    def _accuracy_report(self):
+        pairs = self._label_errors()
+        if not pairs:
+            QMessageBox.information(
+                self, "정확도 리포트",
+                "이 이미지의 라벨에 대응하는 검출을 찾지 못했습니다.")
+            return
+        rel = np.array([(prog - true) / true * 100 for true, prog in pairs])
+        u = self.unit
+        QMessageBox.information(
+            self, "정확도 리포트",
+            f"라벨 {len(pairs)}개 기준 (이 이미지)\n\n"
+            f"평균 절대 오차: {np.abs(rel).mean():.2f} %\n"
+            f"편향(평균 오차): {rel.mean():+.2f} %\n"
+            f"표준편차: {rel.std():.2f} %\n"
+            f"최대 오차: {np.abs(rel).max():.2f} %\n\n"
+            "※ 대표 입자를 골고루 라벨해야 실제 정확도에 가깝습니다. "
+            "틀린 것만 라벨하면 나쁘게 나옵니다.")
+
+    def _export_labels_csv(self):
+        if not self._labels:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "라벨 CSV 내보내기", "tem_labels.csv", "CSV 파일 (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                f.write("image,center_x,center_y,true_diameter,program_diameter,error_pct,time\n")
+                for key, labs in self._labels.items():
+                    name = key.split("|")[0]
+                    for lab in labs:
+                        prog = lab.get("prog_nm")
+                        err = ("" if not prog else
+                               f"{(prog - lab['true_nm']) / lab['true_nm'] * 100:.2f}")
+                        f.write(f"{name},{lab['cx']},{lab['cy']},{lab['true_nm']},"
+                                f"{'' if prog is None else prog},{err},"
+                                f"{lab.get('time') or ''}\n")
+        except OSError as e:
+            self.statusBar().showMessage(f"CSV 저장 실패: {e}")
+            return
+        total = sum(len(v) for v in self._labels.values())
+        self.statusBar().showMessage(f"라벨 {total}개를 CSV로 저장했습니다: {path}")
+
     def _load_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "TEM 이미지 열기", "",
@@ -940,6 +1126,10 @@ class MainWindow(QMainWindow):
             return
 
         self.original_image = self.image.copy()
+        self._image_path = path
+        self._image_key = labelstore.image_key(path, self.original_image.shape)
+        self.btn_label.setEnabled(True)
+        self._refresh_label_count()
 
         if not self.chk_manual.isChecked():
             detector = ScaleBarDetector()
@@ -1028,6 +1218,9 @@ class MainWindow(QMainWindow):
         valid = self._valid_particles()
         self.btn_export.setEnabled(bool(valid))
         self.btn_calib.setEnabled(bool(valid))
+        has_labels = bool(self._current_labels())
+        self.btn_label_report.setEnabled(has_labels)
+        self.btn_label_export.setEnabled(bool(self._labels))
         n_exc = len(self.particles) - len(valid)
         n_approx = sum(1 for p in valid if p.get("approx"))
         msg = f"분석 완료: {len(valid)}개 입자 검출"
@@ -1182,6 +1375,29 @@ class MainWindow(QMainWindow):
                      (255, 255, 0), max(1, thickness))
             cv2.circle(display, c, max(2, thickness), (255, 255, 0), -1)
 
+        # Ground-truth labels: a magenta marker where a true diameter was
+        # recorded, with the value and, when it matches a detection, the error.
+        # It shows the user which particles they have checked without touching
+        # the measurement.
+        valid = self._valid_particles()
+        for lab in self._current_labels():
+            c = (int(lab["cx"] * scale), int(lab["cy"] * scale))
+            s = max(3, 2 * thickness)
+            cv2.drawMarker(display, c, (255, 0, 255), cv2.MARKER_SQUARE, s * 2, thickness)
+            txt = f"{lab['true_nm']:.0f}"
+            best, best_d = None, None
+            for p in valid:
+                d = np.hypot(p["center_x"] - lab["cx"], p["center_y"] - lab["cy"])
+                if best_d is None or d < best_d:
+                    best, best_d = p, d
+            if best is not None and best_d <= best["radius_px"]:
+                txt += f" ({(best['diameter'] - lab['true_nm']) / lab['true_nm'] * 100:+.0f}%)"
+            org = (c[0] + s + 2, c[1] + s // 2)
+            cv2.putText(display, txt, org, cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4 + 0.06 * scale, (0, 0, 0), thickness + 2)
+            cv2.putText(display, txt, org, cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4 + 0.06 * scale, (255, 0, 255), thickness)
+
         self.result_image = display
         self.btn_save_image.setEnabled(True)
         self._display_image(display)
@@ -1226,6 +1442,12 @@ class MainWindow(QMainWindow):
                               False, color, thickness)
 
     def _on_image_click(self, ox, oy):
+        # Labelling takes the click before anything else: in this mode a click
+        # records a true diameter, it does not toggle a core or restore a
+        # set-aside particle.
+        if self._label_mode:
+            self._label_click(ox, oy)
+            return
         if not self.particles:
             return
         # A set-aside particle is put back, or a restored one set aside again.
