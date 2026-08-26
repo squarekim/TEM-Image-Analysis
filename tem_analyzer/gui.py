@@ -661,6 +661,15 @@ class MainWindow(QMainWindow):
         self.lbl_label_count = QLabel("이 이미지 라벨 0개")
         label_form.addRow("기록:", self.lbl_label_count)
 
+        self.btn_label_calib = QPushButton("이 라벨로 보정")
+        self.btn_label_calib.setEnabled(False)
+        self.btn_label_calib.setToolTip(
+            "이 이미지에 기록한 참값을 기준으로 전체 입자의 지름을 다시 잡습니다.\n"
+            "라벨은 이미 저장돼 있으므로, 여기서 나온 보정값도 저장되어\n"
+            "같은 시료의 다음 이미지에 자동 적용됩니다 — 쌓을수록 라벨이 덜 필요해집니다.")
+        self.btn_label_calib.clicked.connect(self._calibrate_from_labels)
+        label_form.addRow(self.btn_label_calib)
+
         label_btns = QHBoxLayout()
         self.btn_label_report = QPushButton("정확도 리포트")
         self.btn_label_report.setEnabled(False)
@@ -978,6 +987,47 @@ class MainWindow(QMainWindow):
         self.lbl_label_count.setText(f"이 이미지 라벨 {n}개")
         self.btn_label_report.setEnabled(n > 0 and bool(self.particles))
         self.btn_label_export.setEnabled(bool(self._labels))
+        self.btn_label_calib.setEnabled(
+            n >= 3 and bool(self.particles) and self.nm_per_px is not None)
+
+    def _calibrate_from_labels(self):
+        # The archived true values ARE calibration references: each is a
+        # (position, true diameter), which is what the wall-place calibration
+        # needs. Feeding them in is what turns "recording data" into "the
+        # measurement getting better" - and because the resulting place is
+        # stored like any calibration, the next image of the same specimen
+        # picks it up without any labelling at all.
+        labs = self._current_labels()
+        if len(labs) < 3 or self.nm_per_px is None or not self.particles:
+            return
+        # true_nm -> px for this image's scale; the place itself is a fraction
+        # and stays scale-independent.
+        refs = [(lab["cx"], lab["cy"], lab["true_nm"] / self.nm_per_px)
+                for lab in labs]
+        analyzer = ParticleAnalyzer(
+            nm_per_px=self.nm_per_px,
+            edge_level=("auto" if self.chk_edge_auto.isChecked()
+                        else self.spin_edge.value() / 100.0),
+            sphere_edge=self.chk_sphere_edge.isChecked())
+        before = np.median([p["diameter"] for p in self._valid_particles()]) \
+            if self._valid_particles() else 0.0
+        place, used = analyzer.calibrate_to_measurements(
+            self.particles, refs, self.original_image, apply=False)
+        if place is None:
+            self.statusBar().showMessage(
+                "보정 실패: 라벨 위치에서 쉘 벽을 찾지 못했습니다.")
+            return
+        self.wall_place = place
+        self._run_analysis()
+        self._save_settings(config.default_path(), quiet=True)
+        after = np.median([p["diameter"] for p in self._valid_particles()]) \
+            if self._valid_particles() else 0.0
+        self.lbl_calib.setText(f"적용됨 · 벽 위치 {place:.2f} (라벨 {used}개)")
+        self.btn_calib_reset.setEnabled(True)
+        u = self.unit
+        self.statusBar().showMessage(
+            f"라벨 {used}개로 보정: 벽 위치 {place:.2f}. D50 {before:.1f} → {after:.1f} {u}. "
+            "저장되어 같은 시료의 다음 이미지에 자동 적용됩니다.")
 
     def _toggle_label_mode(self, on):
         # Labelling clicks a particle; it must not fight the scale-bar or
@@ -1218,9 +1268,7 @@ class MainWindow(QMainWindow):
         valid = self._valid_particles()
         self.btn_export.setEnabled(bool(valid))
         self.btn_calib.setEnabled(bool(valid))
-        has_labels = bool(self._current_labels())
-        self.btn_label_report.setEnabled(has_labels)
-        self.btn_label_export.setEnabled(bool(self._labels))
+        self._refresh_label_count()
         n_exc = len(self.particles) - len(valid)
         n_approx = sum(1 for p in valid if p.get("approx"))
         msg = f"분석 완료: {len(valid)}개 입자 검출"
