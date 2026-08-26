@@ -28,10 +28,24 @@ KEYS = (
 )
 
 
+def data_dir():
+    """Where persisted data (settings, labels) lives.
+
+    Inside a git checkout it is the repo's ``data/`` folder, so a calibration
+    or a label archive is tracked and travels with the project - commit and
+    push and it is in git, on every clone. Installed elsewhere (a zip, a pip
+    install with no repo around it) it falls back to a per-user folder in the
+    home directory, so the program still works standalone.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.isdir(os.path.join(root, ".git")):
+        return os.path.join(root, "data")
+    return os.path.join(os.path.expanduser("~"), ".tem_analyzer")
+
+
 def default_path():
     """Where the auto-persisted settings live, created on first save."""
-    base = os.path.join(os.path.expanduser("~"), ".tem_analyzer")
-    return os.path.join(base, "settings.json")
+    return os.path.join(data_dir(), "settings.json")
 
 
 def save_settings(path, settings):

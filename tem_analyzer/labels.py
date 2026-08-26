@@ -15,6 +15,8 @@ data, deliberately, because that is what the user asked to keep.
 import json
 import os
 
+from . import config
+
 SCHEMA = 1
 
 #: A label replaces an existing one within this many pixels, so re-clicking a
@@ -23,8 +25,8 @@ REPLACE_RADIUS = 15.0
 
 
 def default_path():
-    """Where the archive lives, separate from the settings file."""
-    return os.path.join(os.path.expanduser("~"), ".tem_analyzer", "labels.json")
+    """Where the archive lives, alongside the settings (see config.data_dir)."""
+    return os.path.join(config.data_dir(), "labels.json")
 
 
 def image_key(path, shape):
