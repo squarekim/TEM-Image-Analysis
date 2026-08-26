@@ -68,17 +68,22 @@ def labels_for(store, key):
     return store.setdefault(key, [])
 
 
-def add_or_replace(store, key, cx, cy, true_nm, prog_nm=None, when=None):
+def add_or_replace(store, key, cx, cy, true_nm, prog_nm=None, when=None, extra=None):
     """Record a label at (cx, cy), replacing any already within REPLACE_RADIUS.
 
-    Returns (labels, replaced): the image's label list and whether an existing
-    label was edited rather than a new one added.
+    ``extra`` carries the wall-measurement evidence (flank positions, place,
+    profile) so the label describes how its wall was measured, not just its
+    result - which is what lets the calibration be recomputed without the
+    image. Returns (labels, replaced): the image's label list and whether an
+    existing label was edited rather than a new one added.
     """
     labels = labels_for(store, key)
     entry = {"cx": int(round(cx)), "cy": int(round(cy)),
              "true_nm": float(true_nm),
              "prog_nm": (float(prog_nm) if prog_nm is not None else None),
              "time": when}
+    if extra:
+        entry.update(extra)
     for i, lab in enumerate(labels):
         if (lab["cx"] - cx) ** 2 + (lab["cy"] - cy) ** 2 <= REPLACE_RADIUS ** 2:
             labels[i] = entry

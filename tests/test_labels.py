@@ -67,6 +67,29 @@ def main():
     check("size disambiguates key",
           labels.image_key("a.jpg", (100, 100)) != labels.image_key("a.jpg", (200, 200)))
 
+    # The wall evidence rides along with the label, so the calibration is
+    # derivable from the file alone - no image. This is the property that lets
+    # a place computed on one machine be reproduced on another that holds only
+    # the labels.
+    store2 = {}
+    k = labels.image_key("m.jpg", (512, 512))
+    for i, (pos, place) in enumerate([((100, 100), 1.20), ((200, 200), 1.28),
+                                      ((300, 300), 1.24)]):
+        labels.add_or_replace(store2, k, pos[0], pos[1], 90.0, prog_nm=88.0,
+                              extra={"inner_px": 18.0, "outer_px": 23.0,
+                                     "place": place, "profile": [1, 2, 3]})
+    labs = labels.labels_for(store2, k)
+    check("wall evidence stored", all("place" in l and "profile" in l for l in labs))
+    import statistics
+    wp = statistics.median(l["place"] for l in labs)
+    check("place derivable from labels alone", abs(wp - 1.24) < 1e-9)
+    # And it survives the file round trip.
+    p2 = os.path.join(d, "wall.json")
+    labels.save(p2, store2)
+    back2 = labels.load(p2)
+    check("wall evidence survives round trip",
+          back2[k][1]["place"] == 1.28 and back2[k][1]["profile"] == [1, 2, 3])
+
     print("\n" + ("전체 통과" if not failures else "실패: " + "; ".join(failures)))
     return 1 if failures else 0
 

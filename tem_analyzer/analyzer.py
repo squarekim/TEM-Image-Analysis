@@ -2497,6 +2497,62 @@ class ParticleAnalyzer:
                 self._set_radius(p, r)
         return self.wall_place, len(places)
 
+    def wall_context(self, gray, live):
+        """The blurred image and field wall fraction the wall reader needs.
+
+        Computing these scans the whole field, so a caller labelling several
+        particles builds it once and passes it back to `measure_wall` for each,
+        rather than paying for it per click.
+        """
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY) if gray.ndim == 3 else gray
+        cutoff = self._find_scalebar_top(gray)
+        region = gray[:cutoff, :]
+        live = [p for p in live if not p.get("excluded")]
+        angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
+        if not live:
+            return None
+        blurred = cv2.GaussianBlur(region, (0, 0), self._snap_sigma(region, live, angles))
+        return {"blurred": blurred, "wall_at": self._field_wall_fraction(blurred, live)}
+
+    #: Radius fractions at which the stored wall profile is sampled. Fixed, so
+    #: two labels' profiles line up and can be compared or averaged.
+    WALL_PROFILE_FRACS = np.round(np.arange(0.50, 1.61, 0.05), 2)
+
+    def measure_wall(self, cx, cy, r, context):
+        """Measure the shell wall at one point, and return how it was measured.
+
+        The point of storing this with a label is that the calibration then
+        does not need the image any more: the label carries where its wall's
+        inner and outer flanks sit, and the median radial brightness profile
+        they were read from, so the place the user's diameter implies can be
+        recomputed - and audited - anywhere, on any machine, without the
+        original micrograph. Measuring a *different* particle still needs that
+        particle's own image, because its wall is its own; this is about making
+        the calibration reproducible, not about copying one wall onto another.
+
+        Returns None if the wall is not resolved at that point.
+        """
+        if context is None:
+            return None
+        blurred, wall_at = context["blurred"], context["wall_at"]
+        h, w = blurred.shape
+        angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
+        _r, _s, rim, (inner, outer) = self._outer_by_level(
+            blurred, cx, cy, r, angles, w, h,
+            frac=self.edge_level, wall_only=True, wall_at=wall_at)
+        if not (np.isfinite(inner) and np.isfinite(outer) and outer > inner):
+            return None
+        fracs = self.WALL_PROFILE_FRACS
+        xs = np.clip((cx + r * np.outer(np.cos(angles), fracs)).astype(int), 0, w - 1)
+        ys = np.clip((cy + r * np.outer(np.sin(angles), fracs)).astype(int), 0, h - 1)
+        profile = np.median(blurred[ys, xs].astype(np.float32), axis=0)
+        return {
+            "inner_px": float(inner),
+            "outer_px": float(outer),
+            "fracs": [float(f) for f in fracs],
+            "profile": [float(v) for v in profile],
+        }
+
     def _snap_sigma(self, gray, live, angles):
         """How much to smooth before reading the wall: a share of the wall.
 

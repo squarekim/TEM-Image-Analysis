@@ -370,6 +370,11 @@ class MainWindow(QMainWindow):
         self._labels = labelstore.load(labelstore.default_path())
         self._image_path = None
         self._image_key = None
+        #: The blurred image + field wall fraction the wall reader needs, built
+        #: once per analysis and reused for every label click; cleared when the
+        #: field is re-analysed.
+        self._wall_ctx = None
+        self._wall_analyzer = None
 
         self._build_ui()
         # Carry the last session's settings - above all a hand calibration -
@@ -1000,10 +1005,6 @@ class MainWindow(QMainWindow):
         labs = self._current_labels()
         if len(labs) < 3 or self.nm_per_px is None or not self.particles:
             return
-        # true_nm -> px for this image's scale; the place itself is a fraction
-        # and stays scale-independent.
-        refs = [(lab["cx"], lab["cy"], lab["true_nm"] / self.nm_per_px)
-                for lab in labs]
         analyzer = ParticleAnalyzer(
             nm_per_px=self.nm_per_px,
             edge_level=("auto" if self.chk_edge_auto.isChecked()
@@ -1011,8 +1012,20 @@ class MainWindow(QMainWindow):
             sphere_edge=self.chk_sphere_edge.isChecked())
         before = np.median([p["diameter"] for p in self._valid_particles()]) \
             if self._valid_particles() else 0.0
-        place, used = analyzer.calibrate_to_measurements(
-            self.particles, refs, self.original_image, apply=False)
+        # Each label already carries the place its wall gave (measured when it
+        # was recorded), so the calibration comes straight from the stored
+        # data - no image needed, and identical to what a machine holding only
+        # labels.json would compute. Labels without a stored place (older ones)
+        # fall back to measuring against the current image.
+        stored = [lab["place"] for lab in labs if lab.get("place") is not None]
+        if len(stored) >= 3:
+            place, used = float(np.median(stored)), len(stored)
+            analyzer.wall_place = place
+        else:
+            refs = [(lab["cx"], lab["cy"], lab["true_nm"] / self.nm_per_px)
+                    for lab in labs]
+            place, used = analyzer.calibrate_to_measurements(
+                self.particles, refs, self.original_image, apply=False)
         if place is None:
             self.statusBar().showMessage(
                 "보정 실패: 라벨 위치에서 쉘 벽을 찾지 못했습니다.")
@@ -1086,9 +1099,14 @@ class MainWindow(QMainWindow):
                 self._refresh_label_count()
                 self.statusBar().showMessage("라벨을 삭제했습니다.")
             return
+        # Measure the wall at this point and keep it with the label: the flank
+        # positions, the place the user's diameter implies across them, and the
+        # radial profile they came from. This is what makes the calibration
+        # reproducible from the labels alone, without the image.
+        extra = self._wall_evidence(cx, cy, best, value)
         _, replaced = labelstore.add_or_replace(
             self._labels, self._image_key, cx, cy, value, prog_nm,
-            when=datetime.now().isoformat(timespec="seconds"))
+            when=datetime.now().isoformat(timespec="seconds"), extra=extra)
         self._save_labels()
         self._draw_results()
         self._refresh_label_count()
@@ -1097,6 +1115,36 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             (f"라벨 {'수정' if replaced else '기록'}: {value:.1f} {u}{err}. "
              f"이 이미지 {len(self._current_labels())}개."))
+
+    def _wall_evidence(self, cx, cy, particle, true_nm):
+        """Measure the wall at a labelled point, returning it plus the place.
+
+        The wall context (blurred image, field wall fraction) is built once per
+        analysis and cached, so labelling many particles does not re-scan the
+        field each time.
+        """
+        if self._wall_ctx is None:
+            analyzer = ParticleAnalyzer(
+                nm_per_px=self.nm_per_px,
+                edge_level=("auto" if self.chk_edge_auto.isChecked()
+                            else self.spin_edge.value() / 100.0),
+                sphere_edge=self.chk_sphere_edge.isChecked())
+            self._wall_analyzer = analyzer
+            self._wall_ctx = analyzer.wall_context(self.original_image, self.particles)
+        if self._wall_ctx is None or particle is None:
+            return None
+        wall = self._wall_analyzer.measure_wall(
+            cx, cy, particle["radius_px"], self._wall_ctx)
+        if wall is None:
+            return None
+        # Where the user's true diameter sits across this wall (0 = inner flank,
+        # 1 = outer). Stored so the calibration is derivable without the image.
+        true_px = (true_nm / self.nm_per_px) / 2.0 if self.nm_per_px else None
+        if true_px is not None and wall["outer_px"] > wall["inner_px"]:
+            wall["place"] = float((true_px - wall["inner_px"])
+                                  / (wall["outer_px"] - wall["inner_px"]))
+        wall["nm_per_px"] = self.nm_per_px
+        return wall
 
     def _save_labels(self):
         try:
@@ -1146,7 +1194,8 @@ class MainWindow(QMainWindow):
             return
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:
-                f.write("image,center_x,center_y,true_diameter,program_diameter,error_pct,time\n")
+                f.write("image,center_x,center_y,true_diameter,program_diameter,"
+                        "error_pct,wall_inner_px,wall_outer_px,wall_place,time\n")
                 for key, labs in self._labels.items():
                     name = key.split("|")[0]
                     for lab in labs:
@@ -1155,7 +1204,8 @@ class MainWindow(QMainWindow):
                                f"{(prog - lab['true_nm']) / lab['true_nm'] * 100:.2f}")
                         f.write(f"{name},{lab['cx']},{lab['cy']},{lab['true_nm']},"
                                 f"{'' if prog is None else prog},{err},"
-                                f"{lab.get('time') or ''}\n")
+                                f"{lab.get('inner_px', '')},{lab.get('outer_px', '')},"
+                                f"{lab.get('place', '')},{lab.get('time') or ''}\n")
         except OSError as e:
             self.statusBar().showMessage(f"CSV 저장 실패: {e}")
             return
@@ -1204,6 +1254,8 @@ class MainWindow(QMainWindow):
     def _run_analysis(self):
         if self.image is None:
             return
+        # The field changed, so the cached wall context is stale.
+        self._wall_ctx = None
 
         if self.chk_manual.isChecked():
             bar_px = self.spin_bar_px.value()
