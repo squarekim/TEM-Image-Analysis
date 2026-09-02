@@ -3472,8 +3472,13 @@ class ParticleAnalyzer:
         if max_val < 5:
             return []
 
-        smoothed = cv2.GaussianBlur(dist, (0, 0), sigmaX=max(1, max_val * 0.15))
-        ksize = max(3, int(max_val * 0.5)) | 1
+        smoothed = cv2.GaussianBlur(dist, (0, 0), sigmaX=max(1, max_val * 0.08))
+        # Keep separate distance peaks in modestly overlapping clusters.  The
+        # previous half-radius non-maximum window collapsed a three-particle
+        # clump into one or two seeds before watershed ever had a chance to
+        # split it; a quarter-radius window still suppresses rim/noise plateaus
+        # while preserving one marker per particle centre.
+        ksize = max(3, int(max_val * 0.25)) | 1
         dilated = cv2.dilate(smoothed, np.ones((ksize, ksize)))
         local_max = (smoothed == dilated) & (smoothed > max_val * 0.2) & (mask > 0)
         local_max = local_max.astype(np.uint8)
