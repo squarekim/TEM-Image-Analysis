@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
     QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox, QSplitter,
     QMessageBox, QHeaderView, QComboBox, QCheckBox, QProgressBar,
-    QInputDialog, QScrollArea,
+    QInputDialog, QScrollArea, QTabWidget,
 )
 from PyQt5.QtCore import Qt, QPoint, QRectF
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
@@ -462,8 +462,28 @@ class MainWindow(QMainWindow):
         self.histogram = HistogramCanvas()
         left_layout.addWidget(self.histogram, stretch=1)
 
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
+        # The controls split into two tabs: everyday measurement (scale,
+        # parameters, statistics) on one, and the one-time calibration and
+        # labelling on the other. After the boundary has been calibrated once,
+        # the daily loop is just analyse-and-read-stats, so those live together
+        # and the setup tools stay out of the way.
+        right_tabs = QTabWidget()
+
+        def _scroll_page():
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setWidget(page)
+            return scroll, layout
+
+        basic_scroll, basic_layout = _scroll_page()
+        tools_scroll, tools_layout = _scroll_page()
+        right_tabs.addTab(basic_scroll, "기본")
+        right_tabs.addTab(tools_scroll, "보정 · 라벨링")
+        # Groups add themselves to whichever tab they belong to.
+        right_layout = basic_layout
 
         scale_group = QGroupBox("스케일바 설정")
         scale_form = QFormLayout()
@@ -649,7 +669,7 @@ class MainWindow(QMainWindow):
         calib_form.addRow(settings_btns)
 
         calib_group.setLayout(calib_form)
-        right_layout.addWidget(calib_group)
+        tools_layout.addWidget(calib_group)
 
         label_group = QGroupBox("참값 라벨링 (데이터 기록)")
         label_form = QFormLayout()
@@ -687,7 +707,8 @@ class MainWindow(QMainWindow):
         label_form.addRow(label_btns)
 
         label_group.setLayout(label_form)
-        right_layout.addWidget(label_group)
+        tools_layout.addWidget(label_group)
+        tools_layout.addStretch(1)
 
         stats_group = QGroupBox("통계 결과")
         stats_form = QFormLayout()
@@ -728,18 +749,9 @@ class MainWindow(QMainWindow):
         self.table.setMinimumHeight(180)
         right_layout.addWidget(self.table)
 
-        # The control column has more groups than fit at a normal window
-        # height; without this they compress until the spinboxes and their
-        # labels overlap and cannot be clicked. A scroll area lets each group
-        # keep its natural size and the user scroll to the rest.
-        right_scroll = QScrollArea()
-        right_scroll.setWidgetResizable(True)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        right_scroll.setWidget(right)
-        right_scroll.setMinimumWidth(340)
-
+        right_tabs.setMinimumWidth(340)
         splitter.addWidget(left)
-        splitter.addWidget(right_scroll)
+        splitter.addWidget(right_tabs)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
 
