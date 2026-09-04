@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
     QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox, QSplitter,
     QMessageBox, QHeaderView, QComboBox, QCheckBox, QProgressBar,
-    QInputDialog,
+    QInputDialog, QScrollArea,
 )
 from PyQt5.QtCore import Qt, QPoint, QRectF
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
@@ -725,10 +725,21 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(["#", "직경", "면적"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSortingEnabled(True)
+        self.table.setMinimumHeight(180)
         right_layout.addWidget(self.table)
 
+        # The control column has more groups than fit at a normal window
+        # height; without this they compress until the spinboxes and their
+        # labels overlap and cannot be clicked. A scroll area lets each group
+        # keep its natural size and the user scroll to the rest.
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_scroll.setWidget(right)
+        right_scroll.setMinimumWidth(340)
+
         splitter.addWidget(left)
-        splitter.addWidget(right)
+        splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
 
