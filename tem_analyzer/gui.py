@@ -621,6 +621,15 @@ class MainWindow(QMainWindow):
         self.chk_mark_inferred.toggled.connect(self._redraw_results)
         param_form.addRow(self.chk_mark_inferred)
 
+        self.chk_numbers_only = QCheckBox("번호만 표시 (외곽선 숨김)")
+        self.chk_numbers_only.setChecked(False)
+        self.chk_numbers_only.setToolTip(
+            "검출된 외곽선을 모두 숨기고 입자 번호만 남깁니다.\n"
+            "선이 두꺼워 입자 경계가 가려질 때, 실제 입자를 보며\n"
+            "직접 재거나 라벨을 찍기 좋습니다. 측정값은 바뀌지 않습니다.")
+        self.chk_numbers_only.toggled.connect(self._redraw_results)
+        param_form.addRow(self.chk_numbers_only)
+
         param_group.setLayout(param_form)
         right_layout.addWidget(param_group)
 
@@ -1409,12 +1418,31 @@ class MainWindow(QMainWindow):
         display = cv2.resize(self.original_image, None, fx=scale, fy=scale,
                              interpolation=cv2.INTER_CUBIC) if scale > 1 else self.original_image.copy()
         thickness = max(2, scale)
+        # A clean view for hand-measuring: hide every outline and inner mark,
+        # leaving only the numbers so the real particle edge is not covered by
+        # the detection line. It does not touch the measurement, only the draw.
+        numbers_only = self.chk_numbers_only.isChecked()
         _, overlapping = self._overlapping_pairs()
         num = 0
         for p in self.particles:
             cx, cy = p["center_x"] * scale, p["center_y"] * scale
             r = int(p["radius_px"]) * scale
             excluded = p.get("excluded", False)
+            if numbers_only:
+                # Excluded particles carry no number, so nothing is drawn for
+                # them; the rest get their number only.
+                if excluded:
+                    continue
+                num += 1
+                txt = str(num)
+                pos = (cx - 8 * len(txt), cy - 6)
+                font_scale = 0.45 + 0.1 * scale
+                ink = (255, 80, 255) if p.get("irregular") else (80, 255, 255)
+                cv2.putText(display, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                            font_scale, (0, 0, 0), 3)
+                cv2.putText(display, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                            font_scale, ink, 1)
+                continue
             if excluded and p.get("unoutlined") and not p.get("restored"):
                 # Not deleted, offered. The measurement that finds phantoms -
                 # how much of the circumference carries a dark ring - cannot
@@ -1478,8 +1506,9 @@ class MainWindow(QMainWindow):
             cv2.putText(display, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
                         font_scale, ink, 1)
 
-        legend = [("OK", (0, 220, 0)), ("Approx", (0, 220, 220)),
-                  ("Overlap", (255, 0, 255)), ("Excluded", (0, 0, 255))]
+        legend = ([] if numbers_only else
+                  [("OK", (0, 220, 0)), ("Approx", (0, 220, 220)),
+                   ("Overlap", (255, 0, 255)), ("Excluded", (0, 0, 255))])
         lx = 10
         for label, color in legend:
             cv2.rectangle(display, (lx, 10), (lx + 18, 28), color, -1)
